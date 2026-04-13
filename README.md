@@ -3,13 +3,38 @@
 把任意二维目标图像反求成一个混沌离散映射的物理不变测度——也就是
 **逆 Frobenius–Perron 问题 (IFPP)** 在二维图像生成上的工程化求解。本仓库
 按论文 *Inverse Optimization of Chaotic Attractors* 中描述的架构完整实现
-了该算法，单文件 (`main.py`)、自包含、仅依赖 NumPy 与 Pillow。
+了该算法，包含主优化器 (`main.py`) 和目标预处理脚本
+(`preprocess_target.py`)，自包含、仅依赖 NumPy 与 Pillow。
 
-```
+```bash
 uv run python main.py target.png --gens 80 --pop 24 --size 96 --out result.png
+uv run python main.py target.png --model poly_sin3d --loss-mode multiscale --size 128
 ```
 
 输出是一张并排的 `target | attractor` 灰度图。
+
+如果输入是普通照片或线稿，建议先把它转换成更像“物理不变测度”的目标密度：
+
+```bash
+uv run python preprocess_target.py portrait.jpg \
+    --out portrait_target.png \
+    --preview portrait_target_preview.png \
+    --crop
+
+uv run python main.py portrait_target.png --gens 80 --pop 24 --size 96
+```
+
+实验性的 3D latent `poly_sin3d` 路径推荐这样跑：
+
+```bash
+uv run python main.py experiment_outputs/target_density_512.png \
+    --model poly_sin3d \
+    --loss-mode multiscale \
+    --size 128 \
+    --n-iter 180000 \
+    --gens 200 \
+    --out face_poly_sin3d.png
+```
 
 ---
 
@@ -146,10 +171,16 @@ uv sync
 # 使用合成默认目标快速体验
 uv run python main.py --gens 30 --pop 16 --n-iter 20000 --size 64
 
-# 用一张自己的灰度图作为目标
+# 用一张自己的灰度图作为目标（原始 2D quadratic baseline）
 uv run python main.py path/to/target.png \
     --gens 80 --pop 24 --size 96 --n-iter 60000 \
     --out result.png --seed 42
+
+# 用新的 3D latent poly+sin 模型 + multiscale SWD
+uv run python main.py path/to/target.png \
+    --model poly_sin3d --loss-mode multiscale \
+    --size 128 --n-iter 180000 --gens 200 \
+    --out result_poly_sin3d.png --seed 42
 ```
 
 命令行参数：
@@ -159,9 +190,11 @@ uv run python main.py path/to/target.png \
 | `target` (位置) | 合成图样 | 灰度目标图像路径，深色 = 高密度 |
 | `--out` | `best_attractor.png` | 输出路径（target \| attractor 并排） |
 | `--gens` | 80 | CMA-ES 代数 |
-| `--pop` | 24 | 种群大小 λ |
+| `--pop` | 24 / 32 | 种群大小 λ（`poly_sin3d` 默认更大） |
 | `--size` | 96 | 输出方形分辨率 |
 | `--n-iter` | 60000 | 单次光栅化的轨道长度 |
+| `--model` | `quadratic2d` | 动力系统族：原始 2D quadratic 或实验性 `poly_sin3d` |
+| `--loss-mode` | `single` | 单尺度 SWD 或 coarse-to-fine 的 `multiscale` |
 | `--seed` | 42 | NumPy 随机种子 |
 
 ---

@@ -1,29 +1,21 @@
 """Inverse Optimization of Strange Attractors for 2D Image Generation.
 
-Complete implementation of the algorithm described in
-"Inverse Optimization of Chaotic Attractors":
+Supports two model families:
 
-    1. 12-parameter 2D general quadratic polynomial map.
-    2. Four-tier Fast Rejection Penalty System
-       (divergence / fixed-point / low-period cycle / Lyapunov).
-    3. Sliced Wasserstein Distance fitness against a target image.
-    4. Self-contained CMA-ES with rank-mu / rank-1 covariance updates.
-    5. Boundary-aware dynamic step-size dampening.
-    6. Logistic-map chaotic noise injection for tunneling between
-       islands of stability.
+1. ``quadratic2d``: the original 12-parameter planar quadratic map.
+2. ``poly_sin3d``: a 27-parameter latent 3D map with bounded sinusoidal
+   folding, projected back to 2D for scoring and rendering.
 
-Usage:
-    uv run python main.py [target_image_path] [--out best.png]
+The optimisation objective can be either:
 
-If no target is provided a synthetic pattern is generated.
+1. ``single``: the original single-scale Sliced Wasserstein distance.
+2. ``multiscale``: a coarse-to-fine weighted sum of SWD terms.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
-import sys
 import time
 from dataclasses import dataclass
 
@@ -31,67 +23,23 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
-# ---------------------------------------------------------------------------
-# 1. Two-dimensional general quadratic polynomial map (12 parameters)
-# ---------------------------------------------------------------------------
-#   x' = p0 + p1 x + p2 x^2 + p3 x y + p4 y + p5 y^2
-#   y' = p6 + p7 x + p8 x^2 + p9 x y + p10 y + p11 y^2
-#
-# All operations are vectorised across the entire CMA-ES population so a
-# single Python-level step advances every individual at once.
-
-PARAM_DIM = 12
-
-
-def quadratic_map(x: np.ndarray, y: np.ndarray, p: np.ndarray):
-    x2, y2, xy = x * x, y * y, x * y
-    nx = (
-        p[..., 0]
-        + p[..., 1] * x
-        + p[..., 2] * x2
-        + p[..., 3] * xy
-        + p[..., 4] * y
-        + p[..., 5] * y2
-    )
-    ny = (
-        p[..., 6]
-        + p[..., 7] * x
-        + p[..., 8] * x2
-        + p[..., 9] * xy
-        + p[..., 10] * y
-        + p[..., 11] * y2
-    )
-    return nx, ny
-
-
-def jacobian(x: np.ndarray, y: np.ndarray, p: np.ndarray):
-    j11 = p[..., 1] + 2.0 * p[..., 2] * x + p[..., 3] * y
-    j12 = p[..., 3] * x + p[..., 4] + 2.0 * p[..., 5] * y
-    j21 = p[..., 7] + 2.0 * p[..., 8] * x + p[..., 9] * y
-    j22 = p[..., 9] * x + p[..., 10] + 2.0 * p[..., 11] * y
-    return j11, j12, j21, j22
-
-
-# ---------------------------------------------------------------------------
-# 2. Fast Rejection Penalty System
-# ---------------------------------------------------------------------------
 @dataclass
 class Config:
-    pop: int = 24                       # CMA-ES population (lambda)
-    n_test: int = 600                   # transient testing iterations
-    n_iter: int = 60_000                # rasterisation orbit length
-    n_sample: int = 4096                # subsample size for SWD
-    n_proj: int = 48                    # SWD random projection count
-    img_size: int = 96                  # square output resolution
+    pop: int = 24
+    n_test: int = 600
+    n_iter: int = 60_000
+    n_sample: int = 4096
+    n_proj: int = 48
+    img_size: int = 96
     max_gens: int = 80
     sigma0: float = 0.15
 
-    escape_radius: float = 1.0e6        # Tier 1
-    fp_eps: float = 1.0e-6              # Tier 2
-    cycle_window: int = 64              # Tier 3 ring buffer length
-    cycle_eps: float = 1.0e-5           # Tier 3 cycle equality tolerance
+    escape_radius: float = 1.0e6
+    fp_eps: float = 1.0e-6
+    cycle_window: int = 64
+    cycle_eps: float = 1.0e-5
 
-    rejection_threshold: float = 0.70   # boundary-aware dampening trigger
+    rejection_threshold: float = 0.70
     rejection_sigma_damp: float = 0.5
     chaotic_injection_prob: float = 0.10
     chaotic_inject_frac: float = 0.25
@@ -100,111 +48,264 @@ class Config:
     seed: int = 42
     out_path: str = "best_attractor.png"
     target_path: str | None = None
+    model_name: str = "quadratic2d"
+    loss_mode: str = "single"
 
 
-def transient_test(params: np.ndarray, cfg: Config):
-    """Vectorised four-tier fast-rejection transient test.
+@dataclass
+class TargetLevel:
+    scale: int
+    weight: float
+    points: np.ndarray
 
-    Returns
-    -------
-    rejected : (lam,) bool
-    x, y     : (lam,) warmed state vectors
-    lyap     : (lam,) maximal Lyapunov approximation
-    """
-    lam = params.shape[0]
-    x = np.full(lam, 0.1, dtype=np.float64)
-    y = np.full(lam, 0.1, dtype=np.float64)
 
-    rejected = np.zeros(lam, dtype=bool)
+class AttractorModel:
+    name: str
+    state_dim: int
+    param_dim: int
 
-    # Tangent vector for Lyapunov exponent estimation.
-    inv_sqrt2 = 1.0 / math.sqrt(2.0)
-    dx = np.full(lam, inv_sqrt2)
-    dy = np.full(lam, inv_sqrt2)
-    lyap_sum = np.zeros(lam)
+    def step(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
 
-    # Ring buffer for low-period cycle detection.
-    W = cfg.cycle_window
-    hist_x = np.zeros((W, lam))
-    hist_y = np.zeros((W, lam))
+    def jacobian(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
 
-    for step in range(cfg.n_test):
-        nx, ny = quadratic_map(x, y, params)
+    def project(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
 
-        # Tier 1: numerical divergence / overflow.
-        bad = (
-            ~np.isfinite(nx)
-            | ~np.isfinite(ny)
-            | (np.abs(nx) > cfg.escape_radius)
-            | (np.abs(ny) > cfg.escape_radius)
+    def initial_mean(self) -> np.ndarray:
+        raise NotImplementedError
+
+    def initial_state(self, lam: int) -> np.ndarray:
+        raise NotImplementedError
+
+
+class Quadratic2DModel(AttractorModel):
+    name = "quadratic2d"
+    state_dim = 2
+    param_dim = 12
+
+    def step(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        x = state[:, 0]
+        y = state[:, 1]
+        x2 = x * x
+        y2 = y * y
+        xy = x * y
+        nx = (
+            params[:, 0]
+            + params[:, 1] * x
+            + params[:, 2] * x2
+            + params[:, 3] * xy
+            + params[:, 4] * y
+            + params[:, 5] * y2
+        )
+        ny = (
+            params[:, 6]
+            + params[:, 7] * x
+            + params[:, 8] * x2
+            + params[:, 9] * xy
+            + params[:, 10] * y
+            + params[:, 11] * y2
+        )
+        return np.stack([nx, ny], axis=1)
+
+    def jacobian(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        x = state[:, 0]
+        y = state[:, 1]
+        j11 = params[:, 1] + 2.0 * params[:, 2] * x + params[:, 3] * y
+        j12 = params[:, 3] * x + params[:, 4] + 2.0 * params[:, 5] * y
+        j21 = params[:, 7] + 2.0 * params[:, 8] * x + params[:, 9] * y
+        j22 = params[:, 9] * x + params[:, 10] + 2.0 * params[:, 11] * y
+        out = np.empty((state.shape[0], 2, 2), dtype=np.float64)
+        out[:, 0, 0] = j11
+        out[:, 0, 1] = j12
+        out[:, 1, 0] = j21
+        out[:, 1, 1] = j22
+        return out
+
+    def project(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        del params
+        return state[:, :2]
+
+    def initial_mean(self) -> np.ndarray:
+        return np.array(
+            [
+                1.0, 0.0, -1.4, 0.0, 1.0, 0.0,
+                0.0, 0.3, 0.0, 0.0, 0.0, 0.0,
+            ],
+            dtype=float,
         )
 
-        # Tier 2: fixed-point stagnation.
-        fp = np.hypot(nx - x, ny - y) < cfg.fp_eps
-
-        # Tier 3: low-period cycle via ring buffer scan.
-        upto = min(step, W)
-        if upto > 0:
-            ddx = hist_x[:upto] - nx[None, :]
-            ddy = hist_y[:upto] - ny[None, :]
-            cyc = np.any(np.sqrt(ddx * ddx + ddy * ddy) < cfg.cycle_eps, axis=0)
-        else:
-            cyc = np.zeros(lam, dtype=bool)
-        hist_x[step % W] = nx
-        hist_y[step % W] = ny
-
-        # Tier 4: Lyapunov tangent propagation (renormalised every step).
-        j11, j12, j21, j22 = jacobian(x, y, params)
-        ndx = j11 * dx + j12 * dy
-        ndy = j21 * dx + j22 * dy
-        tnorm = np.sqrt(ndx * ndx + ndy * ndy) + 1e-300
-        lyap_sum += np.log(tnorm)
-        dx = ndx / tnorm
-        dy = ndy / tnorm
-
-        rejected |= bad | fp | cyc
-
-        # Freeze rejected individuals to suppress NaN propagation.
-        nx = np.where(rejected, 0.0, nx)
-        ny = np.where(rejected, 0.0, ny)
-        x, y = nx, ny
-
-    lyap = lyap_sum / cfg.n_test
-    rejected |= ~np.isfinite(lyap)
-    rejected |= lyap < 0.0  # Tier 4 final check
-    return rejected, x, y, lyap
+    def initial_state(self, lam: int) -> np.ndarray:
+        return np.full((lam, 2), 0.1, dtype=np.float64)
 
 
-# ---------------------------------------------------------------------------
-# 3. Empirical-measure rasterisation and Sliced Wasserstein Distance
-# ---------------------------------------------------------------------------
-def simulate_orbit(params: np.ndarray, x0: np.ndarray, y0: np.ndarray, n_iter: int):
-    """Iterate the map n_iter steps for the entire surviving sub-population.
+class PolySin3DModel(AttractorModel):
+    name = "poly_sin3d"
+    state_dim = 3
+    param_dim = 27
 
-    Returns an (n_iter, lam, 2) float32 array of orbit samples.
-    """
-    lam = params.shape[0]
-    out = np.empty((n_iter, lam, 2), dtype=np.float32)
-    x = x0.astype(np.float64).copy()
-    y = y0.astype(np.float64).copy()
-    for step in range(n_iter):
-        nx, ny = quadratic_map(x, y, params)
-        bad = (
-            ~np.isfinite(nx)
-            | ~np.isfinite(ny)
-            | (np.abs(nx) > 1.0e8)
-            | (np.abs(ny) > 1.0e8)
+    def step(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        x = state[:, 0]
+        y = state[:, 1]
+        z = state[:, 2]
+        x2 = x * x
+        y2 = y * y
+        xy = x * y
+
+        sx = np.sin(y + params[:, 8] * z)
+        sy = np.sin(x + params[:, 17] * z)
+        sz = np.sin(params[:, 23] * x + params[:, 24] * y)
+
+        nx = (
+            params[:, 0]
+            + params[:, 1] * x
+            + params[:, 2] * x2
+            + params[:, 3] * xy
+            + params[:, 4] * y
+            + params[:, 5] * y2
+            + params[:, 6] * z
+            + params[:, 7] * sx
         )
-        nx = np.where(bad, 0.0, nx)
-        ny = np.where(bad, 0.0, ny)
-        out[step, :, 0] = nx
-        out[step, :, 1] = ny
-        x, y = nx, ny
-    return out
+        ny = (
+            params[:, 9]
+            + params[:, 10] * x
+            + params[:, 11] * x2
+            + params[:, 12] * xy
+            + params[:, 13] * y
+            + params[:, 14] * y2
+            + params[:, 15] * z
+            + params[:, 16] * sy
+        )
+        nz = (
+            params[:, 18]
+            + params[:, 19] * x
+            + params[:, 20] * y
+            + params[:, 21] * z
+            + params[:, 22] * sz
+        )
+        return np.stack([nx, ny, nz], axis=1)
+
+    def jacobian(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        x = state[:, 0]
+        y = state[:, 1]
+        z = state[:, 2]
+
+        cx = np.cos(y + params[:, 8] * z)
+        cy = np.cos(x + params[:, 17] * z)
+        cz = np.cos(params[:, 23] * x + params[:, 24] * y)
+
+        out = np.empty((state.shape[0], 3, 3), dtype=np.float64)
+        out[:, 0, 0] = params[:, 1] + 2.0 * params[:, 2] * x + params[:, 3] * y
+        out[:, 0, 1] = params[:, 3] * x + params[:, 4] + params[:, 7] * cx
+        out[:, 0, 2] = params[:, 6] + params[:, 7] * cx * params[:, 8]
+
+        out[:, 1, 0] = (
+            params[:, 10] + 2.0 * params[:, 11] * x + params[:, 12] * y + params[:, 16] * cy
+        )
+        out[:, 1, 1] = params[:, 12] * x + params[:, 13] + 2.0 * params[:, 14] * y
+        out[:, 1, 2] = params[:, 15] + params[:, 16] * cy * params[:, 17]
+
+        out[:, 2, 0] = params[:, 19] + params[:, 22] * cz * params[:, 23]
+        out[:, 2, 1] = params[:, 20] + params[:, 22] * cz * params[:, 24]
+        out[:, 2, 2] = params[:, 21]
+        return out
+
+    def project(self, state: np.ndarray, params: np.ndarray) -> np.ndarray:
+        x = state[:, 0]
+        y = state[:, 1]
+        z = state[:, 2]
+        u = x + params[:, 25] * z
+        v = y + params[:, 26] * z
+        return np.stack([u, v], axis=1)
+
+    def initial_mean(self) -> np.ndarray:
+        return np.array(
+            [
+                1.0, 0.0, -1.4, 0.0, 1.0, 0.0, 0.0, 0.15, 0.40,
+                0.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.12, -0.35,
+                0.0, 0.15, -0.10, 0.25, 0.10, 0.80, -0.60, 0.30, 0.20,
+            ],
+            dtype=float,
+        )
+
+    def initial_state(self, lam: int) -> np.ndarray:
+        out = np.zeros((lam, 3), dtype=np.float64)
+        out[:, 0] = 0.1
+        out[:, 1] = 0.1
+        return out
+
+
+MODELS = {
+    "quadratic2d": Quadratic2DModel(),
+    "poly_sin3d": PolySin3DModel(),
+}
+
+
+def get_model(name: str) -> AttractorModel:
+    try:
+        return MODELS[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown model: {name}") from exc
+
+
+def load_target_image(path: str | None, size: int) -> np.ndarray:
+    """Return an HxW float32 density (high value = high desired density)."""
+    if path is None:
+        img = Image.new("L", (size, size), 0)
+        d = ImageDraw.Draw(img)
+        d.ellipse([size * 0.18, size * 0.18, size * 0.82, size * 0.82], outline=255, width=2)
+        d.line([size * 0.2, size * 0.5, size * 0.8, size * 0.5], fill=255, width=2)
+        d.line([size * 0.5, size * 0.2, size * 0.5, size * 0.8], fill=255, width=2)
+        return np.asarray(img, dtype=np.float32)
+
+    img = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
+    a = np.asarray(img, dtype=np.float32)
+    a = 255.0 - a
+    return np.maximum(a, 0.0)
+
+
+def sample_target_points(target_density: np.ndarray, n: int, rng) -> np.ndarray:
+    h, w = target_density.shape
+    flat = target_density.astype(np.float64).ravel()
+    s = flat.sum()
+    if s <= 0:
+        raise ValueError("target image density is empty")
+    probs = flat / s
+    idx = rng.choice(h * w, size=n, p=probs)
+    py = idx // w
+    px = idx % w
+    px = px.astype(np.float64) + rng.random(n)
+    py = py.astype(np.float64) + rng.random(n)
+    return np.stack([px, py], axis=1)
+
+
+def multiscale_spec(img_size: int) -> list[tuple[int, float]]:
+    raw = [
+        (max(24, img_size // 4), 0.25),
+        (max(32, img_size // 2), 0.35),
+        (img_size, 0.40),
+    ]
+    merged: dict[int, float] = {}
+    for scale, weight in raw:
+        merged[scale] = merged.get(scale, 0.0) + weight
+    return list(merged.items())
+
+
+def build_target_levels(cfg: Config, rng) -> tuple[np.ndarray, list[TargetLevel]]:
+    full_density = load_target_image(cfg.target_path, cfg.img_size)
+    if cfg.loss_mode == "single":
+        return full_density, [TargetLevel(cfg.img_size, 1.0, sample_target_points(full_density, cfg.n_sample, rng))]
+
+    levels: list[TargetLevel] = []
+    for scale, weight in multiscale_spec(cfg.img_size):
+        density = full_density if scale == cfg.img_size else load_target_image(cfg.target_path, scale)
+        pts = sample_target_points(density, cfg.n_sample, rng)
+        levels.append(TargetLevel(scale=scale, weight=weight, points=pts))
+    return full_density, levels
 
 
 def normalise_points(pts: np.ndarray, size: int):
-    """Rescale a 2D point cloud into the [0, size] x [0, size] image frame."""
     finite = np.isfinite(pts).all(axis=1)
     if finite.sum() < 16:
         return None
@@ -216,7 +317,8 @@ def normalise_points(pts: np.ndarray, size: int):
     if rx < 1e-9 or ry < 1e-9:
         return None
     s = max(rx, ry)
-    cx, cy = 0.5 * (xmin + xmax), 0.5 * (ymin + ymax)
+    cx = 0.5 * (xmin + xmax)
+    cy = 0.5 * (ymin + ymax)
     out = np.empty_like(pts)
     out[:, 0] = (pts[:, 0] - cx) / s * (0.9 * size) + 0.5 * size
     out[:, 1] = (pts[:, 1] - cy) / s * (0.9 * size) + 0.5 * size
@@ -232,17 +334,12 @@ def histogram_from_points(pts: np.ndarray, size: int):
 
 
 def sliced_wasserstein(pts_g: np.ndarray, pts_t: np.ndarray, n_proj: int, rng):
-    """Monte-Carlo Sliced Wasserstein-1 between two equally sized point clouds.
-
-    For every random projection direction the per-axis cost is the
-    closed-form 1D optimal transport — a sort followed by an L1 difference.
-    """
     if pts_g.shape[0] != pts_t.shape[0]:
         n = min(pts_g.shape[0], pts_t.shape[0])
         pts_g = pts_g[:n]
         pts_t = pts_t[:n]
     thetas = rng.uniform(0.0, math.pi, n_proj)
-    dirs = np.stack([np.cos(thetas), np.sin(thetas)], axis=1)  # (K, 2)
+    dirs = np.stack([np.cos(thetas), np.sin(thetas)], axis=1)
     pg = pts_g @ dirs.T
     pt = pts_t @ dirs.T
     pg.sort(axis=0)
@@ -250,27 +347,84 @@ def sliced_wasserstein(pts_g: np.ndarray, pts_t: np.ndarray, n_proj: int, rng):
     return float(np.mean(np.abs(pg - pt)))
 
 
-def sample_target_points(target_density: np.ndarray, n: int, rng) -> np.ndarray:
-    H, W = target_density.shape
-    flat = target_density.astype(np.float64).ravel()
-    s = flat.sum()
-    if s <= 0:
-        raise ValueError("target image density is empty")
-    probs = flat / s
-    idx = rng.choice(H * W, size=n, p=probs)
-    py = idx // W
-    px = idx % W
-    px = px.astype(np.float64) + rng.random(n)
-    py = py.astype(np.float64) + rng.random(n)
-    return np.stack([px, py], axis=1)
+def state_bad_mask(state: np.ndarray, escape_radius: float) -> np.ndarray:
+    return (~np.isfinite(state)).any(axis=1) | (np.max(np.abs(state), axis=1) > escape_radius)
 
 
-# ---------------------------------------------------------------------------
-# 4. Population evaluation pipeline
-# ---------------------------------------------------------------------------
-def evaluate_population(params, target_pts, cfg, rng):
+def transient_test(model: AttractorModel, params: np.ndarray, cfg: Config):
+    """Vectorised fast-rejection transient test on hidden state."""
     lam = params.shape[0]
-    rejected, x, y, _ = transient_test(params, cfg)
+    state = model.initial_state(lam)
+    rejected = np.zeros(lam, dtype=bool)
+
+    tangent = np.full((lam, model.state_dim), 1.0 / math.sqrt(model.state_dim), dtype=np.float64)
+    lyap_sum = np.zeros(lam, dtype=np.float64)
+
+    hist = np.zeros((cfg.cycle_window, lam, model.state_dim), dtype=np.float64)
+
+    for step in range(cfg.n_test):
+        next_state = model.step(state, params)
+
+        bad = state_bad_mask(next_state, cfg.escape_radius)
+        fp = np.linalg.norm(next_state - state, axis=1) < cfg.fp_eps
+
+        upto = min(step, cfg.cycle_window)
+        if upto > 0:
+            diff = hist[:upto] - next_state[None, :, :]
+            cyc = np.any(np.sqrt(np.sum(diff * diff, axis=2)) < cfg.cycle_eps, axis=0)
+        else:
+            cyc = np.zeros(lam, dtype=bool)
+        hist[step % cfg.cycle_window] = next_state
+
+        jac = model.jacobian(state, params)
+        next_tangent = np.einsum("lij,lj->li", jac, tangent)
+        tnorm = np.linalg.norm(next_tangent, axis=1) + 1e-300
+        lyap_sum += np.log(tnorm)
+        tangent = next_tangent / tnorm[:, None]
+
+        rejected |= bad | fp | cyc
+        state = np.where(rejected[:, None], 0.0, next_state)
+
+    lyap = lyap_sum / cfg.n_test
+    rejected |= ~np.isfinite(lyap)
+    rejected |= lyap < 0.0
+    return rejected, state, lyap
+
+
+def simulate_orbit(model: AttractorModel, params: np.ndarray, state0: np.ndarray, n_iter: int):
+    """Iterate hidden state, storing projected 2D points only."""
+    lam = params.shape[0]
+    out = np.empty((n_iter, lam, 2), dtype=np.float32)
+    state = state0.astype(np.float64).copy()
+
+    for step in range(n_iter):
+        next_state = model.step(state, params)
+        bad = state_bad_mask(next_state, 1.0e8)
+        next_state = np.where(bad[:, None], 0.0, next_state)
+        proj = model.project(next_state, params)
+        proj_bad = (~np.isfinite(proj)).any(axis=1)
+        if np.any(proj_bad):
+            proj = np.where(proj_bad[:, None], 0.0, proj)
+            next_state = np.where(proj_bad[:, None], 0.0, next_state)
+        out[step] = proj.astype(np.float32)
+        state = next_state
+    return out
+
+
+def score_points_against_targets(pts: np.ndarray, target_levels: list[TargetLevel], cfg: Config, rng) -> float:
+    loss = 0.0
+    for level in target_levels:
+        if level.scale == cfg.img_size:
+            scaled_pts = pts
+        else:
+            scaled_pts = pts * (level.scale / cfg.img_size)
+        loss += level.weight * sliced_wasserstein(scaled_pts, level.points, cfg.n_proj, rng)
+    return float(loss)
+
+
+def evaluate_population(model: AttractorModel, params, target_levels, cfg, rng):
+    lam = params.shape[0]
+    rejected, state, _ = transient_test(model, params, cfg)
     fitness = np.full(lam, cfg.max_penalty, dtype=np.float64)
 
     survivors = np.where(~rejected)[0]
@@ -278,13 +432,12 @@ def evaluate_population(params, target_pts, cfg, rng):
         return fitness, 1.0
 
     sp = params[survivors]
-    sx = x[survivors]
-    sy = y[survivors]
-    bad_warm = ~np.isfinite(sx) | ~np.isfinite(sy)
-    sx[bad_warm] = 0.1
-    sy[bad_warm] = 0.1
+    ss = state[survivors].copy()
+    bad_warm = (~np.isfinite(ss)).any(axis=1)
+    if np.any(bad_warm):
+        ss[bad_warm] = model.initial_state(int(np.sum(bad_warm)))
 
-    orbit = simulate_orbit(sp, sx, sy, cfg.n_iter)
+    orbit = simulate_orbit(model, sp, ss, cfg.n_iter)
 
     for j, i in enumerate(survivors):
         pts = orbit[:, j, :].astype(np.float64)
@@ -297,21 +450,19 @@ def evaluate_population(params, target_pts, cfg, rng):
         elif npts.shape[0] < cfg.n_sample:
             sel = rng.choice(npts.shape[0], size=cfg.n_sample, replace=True)
             npts = npts[sel]
-        fitness[i] = sliced_wasserstein(npts, target_pts, cfg.n_proj, rng)
+        fitness[i] = score_points_against_targets(npts, target_levels, cfg, rng)
 
     return fitness, float(rejected.mean())
 
 
-# ---------------------------------------------------------------------------
-# 5. CMA-ES (self-contained, Hansen rank-mu/rank-1 update)
-# ---------------------------------------------------------------------------
 class CMAES:
-    def __init__(self, x0, sigma, pop, rng):
+    def __init__(self, x0, sigma, pop, rng, chaotic_inject_frac: float = 0.25):
         self.n = len(x0)
         self.m = np.asarray(x0, dtype=float).copy()
         self.sigma = float(sigma)
         self.lam = int(pop)
         self.mu = self.lam // 2
+        self.chaotic_inject_frac = float(chaotic_inject_frac)
 
         w = np.log(self.mu + 0.5) - np.log(np.arange(1, self.mu + 1))
         w /= w.sum()
@@ -340,31 +491,25 @@ class CMAES:
         self.counteval = 0
         self.chiN = math.sqrt(n) * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n * n))
         self.rng = rng
-
         self._chaos_state = float(rng.uniform(0.05, 0.95))
 
     def _update_eigen(self):
         self.C = 0.5 * (self.C + self.C.T)
-        D2, self.B = np.linalg.eigh(self.C)
-        D2 = np.maximum(D2, 1e-30)
-        self.D = np.sqrt(D2)
+        d2, self.B = np.linalg.eigh(self.C)
+        d2 = np.maximum(d2, 1e-30)
+        self.D = np.sqrt(d2)
 
     def _logistic_block(self, k: int) -> np.ndarray:
-        """Generate a (k, n) heavy-tailed perturbation block from the
-        logistic map operating in its maximally chaotic regime r=4."""
         out = np.empty((k, self.n))
         s = self._chaos_state
         for i in range(k):
             for d in range(self.n):
                 s = 4.0 * s * (1.0 - s)
-                # Map uniform-ish [0,1] to a heavy-tailed perturbation in
-                # roughly [-3, 3] — substitutes Gaussian sampling.
                 out[i, d] = 6.0 * (s - 0.5)
         self._chaos_state = s
         return out
 
     def ask(self, inject_chaos: bool = False) -> np.ndarray:
-        # Periodic eigen-decomposition of C.
         if (
             self.counteval - self.eigen_eval
             > self.lam / max(self.c1 + self.cmu, 1e-12) / self.n / 10.0
@@ -374,12 +519,11 @@ class CMAES:
 
         z = self.rng.standard_normal((self.lam, self.n))
         if inject_chaos:
-            k = max(1, int(round(self.lam * 0.25)))
+            k = max(1, int(round(self.lam * self.chaotic_inject_frac)))
             z[:k] = self._logistic_block(k)
 
         arz = z * self.D
-        arx = self.m + self.sigma * (arz @ self.B.T)
-        return arx
+        return self.m + self.sigma * (arz @ self.B.T)
 
     def tell(self, arx: np.ndarray, fitness: np.ndarray) -> None:
         self.counteval += self.lam
@@ -389,12 +533,12 @@ class CMAES:
         old_m = self.m.copy()
         self.m = self.weights @ selected
 
-        invD = np.where(self.D > 1e-12, 1.0 / self.D, 0.0)
-        C_invsqrt = (self.B * invD) @ self.B.T
+        inv_d = np.where(self.D > 1e-12, 1.0 / self.D, 0.0)
+        c_invsqrt = (self.B * inv_d) @ self.B.T
 
         self.ps = (1.0 - self.cs) * self.ps + math.sqrt(
             self.cs * (2.0 - self.cs) * self.mueff
-        ) * (C_invsqrt @ (self.m - old_m) / self.sigma)
+        ) * (c_invsqrt @ (self.m - old_m) / self.sigma)
         norm_ps = float(np.linalg.norm(self.ps))
 
         gen = self.counteval / self.lam
@@ -417,77 +561,41 @@ class CMAES:
         self.sigma = float(np.clip(self.sigma, 1e-8, 1e3))
 
 
-# ---------------------------------------------------------------------------
-# 6. Main optimisation loop & utilities
-# ---------------------------------------------------------------------------
-def load_target_image(path: str | None, size: int) -> np.ndarray:
-    """Return an HxW float32 density (high value = high desired density)."""
-    if path is None:
-        # Synthetic default: a hollow heart-ish curve so the demo is fun.
-        img = Image.new("L", (size, size), 0)
-        d = ImageDraw.Draw(img)
-        d.ellipse([size * 0.18, size * 0.18, size * 0.82, size * 0.82], outline=255, width=2)
-        d.line([size * 0.2, size * 0.5, size * 0.8, size * 0.5], fill=255, width=2)
-        d.line([size * 0.5, size * 0.2, size * 0.5, size * 0.8], fill=255, width=2)
-        return np.asarray(img, dtype=np.float32)
-
-    img = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
-    a = np.asarray(img, dtype=np.float32)
-    # Treat dark ink as density.
-    a = 255.0 - a
-    return np.maximum(a, 0.0)
+def density_to_uint8(h: np.ndarray) -> np.ndarray:
+    if h.max() <= 0:
+        return np.zeros_like(h, dtype=np.uint8)
+    h = np.log1p(h)
+    h = h / h.max()
+    return (255.0 * h).astype(np.uint8)
 
 
-def render_attractor(params: np.ndarray, cfg: Config, n_iter: int | None = None) -> np.ndarray:
-    """Render a single parameter vector to a high-quality histogram image."""
+def render_attractor(model: AttractorModel, params: np.ndarray, cfg: Config, n_iter: int | None = None) -> np.ndarray:
     n_iter = n_iter or max(cfg.n_iter * 4, 200_000)
-    p = params.reshape(1, PARAM_DIM)
-    x = np.array([0.1])
-    y = np.array([0.1])
-    # Burn-in.
+    p = params.reshape(1, model.param_dim)
+    state = model.initial_state(1)
     for _ in range(2000):
-        x, y = quadratic_map(x, y, p)
-        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-    orbit = simulate_orbit(p, x, y, n_iter)[:, 0, :].astype(np.float64)
+        state = model.step(state, p)
+        bad = state_bad_mask(state, 1.0e8)
+        state = np.where(bad[:, None], 0.0, state)
+    orbit = simulate_orbit(model, p, state, n_iter)[:, 0, :].astype(np.float64)
     npts = normalise_points(orbit, cfg.img_size)
     if npts is None:
         return np.zeros((cfg.img_size, cfg.img_size), dtype=np.float64)
     return histogram_from_points(npts, cfg.img_size)
 
 
-def density_to_uint8(h: np.ndarray) -> np.ndarray:
-    if h.max() <= 0:
-        return np.zeros_like(h, dtype=np.uint8)
-    # Logarithmic stretching for nicer contrast.
-    h = np.log1p(h)
-    h = h / h.max()
-    return (255.0 * h).astype(np.uint8)
-
-
-def initial_mean() -> np.ndarray:
-    """Seed CMA-ES near a known-chaotic 2D quadratic regime.
-
-    Henon's classical attractor (a=1.4, b=0.3) lives at
-        x' = 1 - 1.4 x^2 + y
-        y' = 0.3 x
-    which is a guaranteed chaotic point in this 12-D parameter space.
-    """
-    return np.array(
-        [
-            1.0, 0.0, -1.4, 0.0, 1.0, 0.0,   # x' coefficients
-            0.0, 0.3, 0.0, 0.0, 0.0, 0.0,    # y' coefficients
-        ],
-        dtype=float,
-    )
-
-
 def optimise(cfg: Config) -> tuple[np.ndarray, float, np.ndarray]:
     rng = np.random.default_rng(cfg.seed)
-    target_density = load_target_image(cfg.target_path, cfg.img_size)
-    target_pts = sample_target_points(target_density, cfg.n_sample, rng)
+    model = get_model(cfg.model_name)
+    target_density, target_levels = build_target_levels(cfg, rng)
 
-    es = CMAES(initial_mean(), cfg.sigma0, cfg.pop, rng)
+    es = CMAES(
+        model.initial_mean(),
+        cfg.sigma0,
+        cfg.pop,
+        rng,
+        chaotic_inject_frac=cfg.chaotic_inject_frac,
+    )
 
     best_loss = math.inf
     best_params = es.m.copy()
@@ -497,10 +605,9 @@ def optimise(cfg: Config) -> tuple[np.ndarray, float, np.ndarray]:
         inject = rng.random() < cfg.chaotic_injection_prob
         arx = es.ask(inject_chaos=inject)
         t0 = time.time()
-        fitness, rej_rate = evaluate_population(arx, target_pts, cfg, rng)
+        fitness, rej_rate = evaluate_population(model, arx, target_levels, cfg, rng)
         dt = time.time() - t0
 
-        # Boundary-aware dynamic step-size dampening.
         if rej_rate > cfg.rejection_threshold:
             es.sigma *= cfg.rejection_sigma_damp
 
@@ -523,38 +630,82 @@ def optimise(cfg: Config) -> tuple[np.ndarray, float, np.ndarray]:
     return best_params, best_loss, target_density
 
 
+def resolve_model_defaults(
+    model_name: str,
+    pop: int | None,
+    sigma0: float | None,
+    n_test: int | None,
+    chaotic_injection_prob: float | None,
+) -> tuple[int, float, int, float]:
+    if model_name == "poly_sin3d":
+        return (
+            32 if pop is None else pop,
+            0.08 if sigma0 is None else sigma0,
+            800 if n_test is None else n_test,
+            0.15 if chaotic_injection_prob is None else chaotic_injection_prob,
+        )
+    return (
+        24 if pop is None else pop,
+        0.15 if sigma0 is None else sigma0,
+        600 if n_test is None else n_test,
+        0.10 if chaotic_injection_prob is None else chaotic_injection_prob,
+    )
+
+
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("target", nargs="?", default=None, help="Path to a target image (grayscale).")
     p.add_argument("--out", default="best_attractor.png")
     p.add_argument("--gens", type=int, default=80)
-    p.add_argument("--pop", type=int, default=24)
+    p.add_argument("--pop", type=int, default=None)
     p.add_argument("--size", type=int, default=96)
     p.add_argument("--n-iter", type=int, default=60_000)
+    p.add_argument("--n-test", type=int, default=None)
+    p.add_argument("--sigma0", type=float, default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--model", choices=sorted(MODELS), default="quadratic2d")
+    p.add_argument("--loss-mode", choices=["single", "multiscale"], default="single")
+    p.add_argument("--chaotic-injection-prob", type=float, default=None)
     args = p.parse_args()
+
+    pop, sigma0, n_test, chaotic_prob = resolve_model_defaults(
+        args.model,
+        args.pop,
+        args.sigma0,
+        args.n_test,
+        args.chaotic_injection_prob,
+    )
     return Config(
-        pop=args.pop,
+        pop=pop,
+        n_test=n_test,
         max_gens=args.gens,
         img_size=args.size,
         n_iter=args.n_iter,
+        sigma0=sigma0,
+        chaotic_injection_prob=chaotic_prob,
         seed=args.seed,
         out_path=args.out,
         target_path=args.target,
+        model_name=args.model,
+        loss_mode=args.loss_mode,
     )
 
 
 def main() -> None:
     cfg = parse_args()
-    print(f"Inverse Frobenius-Perron Optimisation  pop={cfg.pop} gens={cfg.max_gens} "
-          f"size={cfg.img_size} n_iter={cfg.n_iter}")
+    print(
+        "Inverse Frobenius-Perron Optimisation  "
+        f"model={cfg.model_name} loss={cfg.loss_mode} pop={cfg.pop} gens={cfg.max_gens} "
+        f"size={cfg.img_size} n_iter={cfg.n_iter}"
+    )
 
+    model = get_model(cfg.model_name)
     best_params, best_loss, target_density = optimise(cfg)
 
     print("best parameters:")
     print(np.array2string(best_params, precision=5, suppress_small=True))
 
-    final_hist = render_attractor(best_params, cfg, n_iter=max(cfg.n_iter * 4, 250_000))
+    final_hist = render_attractor(model, best_params, cfg, n_iter=max(cfg.n_iter * 4, 250_000))
     img_rendered = density_to_uint8(final_hist)
     target_img = density_to_uint8(target_density)
 
