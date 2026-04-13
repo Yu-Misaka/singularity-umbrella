@@ -194,7 +194,7 @@ uv run python main.py path/to/target.png \
 | `--size` | 96 | 输出方形分辨率 |
 | `--n-iter` | 60000 | 单次光栅化的轨道长度 |
 | `--model` | `quadratic2d` | 动力系统族：原始 2D quadratic 或实验性 `poly_sin3d` |
-| `--loss-mode` | `single` | 单尺度 SWD 或 coarse-to-fine 的 `multiscale` |
+| `--loss-mode` | `single` | 单尺度 SWD，或带 coarse-to-fine 退火与支撑集惩罚的 `multiscale` |
 | `--seed` | 42 | NumPy 随机种子 |
 
 ---
@@ -205,6 +205,9 @@ uv run python main.py path/to/target.png \
   免费——所有个体在同一次循环里向量化推进。
 - `n_iter` 决定经验测度的收敛精度。低分辨率快速实验用 1–2 万；要出图
   前升到 10 万以上，并用 `render_attractor` 的 `n_iter * 4` 自动倍率。
+- `multiscale` 不再简单跟随最终 `--size` 一起放大，而是优先在固定较粗的
+  `32 / 64 / 128` 尺度上对齐整体轮廓，再逐步提高细节权重；这对人脸目标
+  比直接在 512 尺度上比 SWD 稳定得多。
 - `n_proj`（SWD 投影数）50–100 之间方差已经足够低，再加几乎没收益。
 - 若初期长时间 100% 拒绝：调小 `sigma0`（默认 0.15）或换 `initial_mean`。
 - 若困在局部最优：把 `chaotic_injection_prob` 提到 0.2–0.3 强迫探索。

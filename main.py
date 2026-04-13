@@ -55,8 +55,15 @@ class Config:
 @dataclass
 class TargetLevel:
     scale: int
-    weight: float
     points: np.ndarray
+    density: np.ndarray
+
+
+@dataclass
+class SupportTarget:
+    scale: int
+    dt_to_support: np.ndarray
+    support_points: np.ndarray
 
 
 class AttractorModel:
@@ -280,29 +287,106 @@ def sample_target_points(target_density: np.ndarray, n: int, rng) -> np.ndarray:
     return np.stack([px, py], axis=1)
 
 
-def multiscale_spec(img_size: int) -> list[tuple[int, float]]:
-    raw = [
-        (max(24, img_size // 4), 0.25),
-        (max(32, img_size // 2), 0.35),
-        (img_size, 0.40),
-    ]
-    merged: dict[int, float] = {}
-    for scale, weight in raw:
-        merged[scale] = merged.get(scale, 0.0) + weight
-    return list(merged.items())
+def multiscale_spec(img_size: int) -> list[int]:
+    raw = [32, 64, 128]
+    scales = [scale for scale in raw if scale <= img_size]
+    if not scales:
+        scales = [img_size]
+    return scales
 
 
-def build_target_levels(cfg: Config, rng) -> tuple[np.ndarray, list[TargetLevel]]:
+def edt_1d(f: np.ndarray) -> np.ndarray:
+    n = f.shape[0]
+    v = np.zeros(n, dtype=np.int32)
+    z = np.zeros(n + 1, dtype=np.float64)
+    out = np.empty(n, dtype=np.float64)
+    k = 0
+    v[0] = 0
+    z[0] = -np.inf
+    z[1] = np.inf
+    for q in range(1, n):
+        s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
+        while s <= z[k]:
+            k -= 1
+            s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = np.inf
+    k = 0
+    for q in range(n):
+        while z[k + 1] < q:
+            k += 1
+        dq = q - v[k]
+        out[q] = dq * dq + f[v[k]]
+    return out
+
+
+def distance_transform(mask: np.ndarray) -> np.ndarray:
+    inf = 1.0e12
+    f = np.where(mask, 0.0, inf).astype(np.float64)
+    tmp = np.empty_like(f)
+    for x in range(f.shape[1]):
+        tmp[:, x] = edt_1d(f[:, x])
+    out = np.empty_like(tmp)
+    for y in range(tmp.shape[0]):
+        out[y, :] = edt_1d(tmp[y, :])
+    return np.sqrt(out)
+
+
+def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
+    if radius <= 0:
+        return mask
+    out = mask.copy()
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                continue
+            y_src0 = max(0, -dy)
+            y_src1 = min(mask.shape[0], mask.shape[0] - dy)
+            x_src0 = max(0, -dx)
+            x_src1 = min(mask.shape[1], mask.shape[1] - dx)
+            y_dst0 = max(0, dy)
+            y_dst1 = min(mask.shape[0], mask.shape[0] + dy)
+            x_dst0 = max(0, dx)
+            x_dst1 = min(mask.shape[1], mask.shape[1] + dx)
+            out[y_dst0:y_dst1, x_dst0:x_dst1] |= mask[y_src0:y_src1, x_src0:x_src1]
+    return out
+
+
+def density_support_mask(density: np.ndarray) -> np.ndarray:
+    if density.max() <= 0:
+        return np.zeros_like(density, dtype=bool)
+    norm = density / density.max()
+    mask = norm > 0.15
+    return dilate_mask(mask, radius=1)
+
+
+def build_target_levels(cfg: Config, rng) -> tuple[np.ndarray, list[TargetLevel], SupportTarget | None]:
     full_density = load_target_image(cfg.target_path, cfg.img_size)
     if cfg.loss_mode == "single":
-        return full_density, [TargetLevel(cfg.img_size, 1.0, sample_target_points(full_density, cfg.n_sample, rng))]
+        return (
+            full_density,
+            [TargetLevel(cfg.img_size, sample_target_points(full_density, cfg.n_sample, rng), full_density)],
+            None,
+        )
 
     levels: list[TargetLevel] = []
-    for scale, weight in multiscale_spec(cfg.img_size):
-        density = full_density if scale == cfg.img_size else load_target_image(cfg.target_path, scale)
+    for scale in multiscale_spec(cfg.img_size):
+        density = load_target_image(cfg.target_path, scale)
         pts = sample_target_points(density, cfg.n_sample, rng)
-        levels.append(TargetLevel(scale=scale, weight=weight, points=pts))
-    return full_density, levels
+        levels.append(TargetLevel(scale=scale, points=pts, density=density))
+
+    support_scale = min(64, max(level.scale for level in levels))
+    support_density = next(level.density for level in levels if level.scale == support_scale)
+    support_mask = density_support_mask(support_density)
+    support_points = np.argwhere(support_mask).astype(np.int32)
+    support_target = SupportTarget(
+        scale=support_scale,
+        dt_to_support=distance_transform(support_mask),
+        support_points=support_points,
+    )
+    return full_density, levels, support_target
 
 
 def normalise_points(pts: np.ndarray, size: int):
@@ -411,18 +495,61 @@ def simulate_orbit(model: AttractorModel, params: np.ndarray, state0: np.ndarray
     return out
 
 
-def score_points_against_targets(pts: np.ndarray, target_levels: list[TargetLevel], cfg: Config, rng) -> float:
+def multiscale_weights(num_levels: int, progress: float) -> np.ndarray:
+    if num_levels <= 1:
+        return np.array([1.0], dtype=np.float64)
+    if num_levels == 2:
+        if progress < 1.0 / 3.0:
+            return np.array([0.70, 0.30], dtype=np.float64)
+        if progress < 2.0 / 3.0:
+            return np.array([0.40, 0.60], dtype=np.float64)
+        return np.array([0.20, 0.80], dtype=np.float64)
+    if progress < 1.0 / 3.0:
+        return np.array([0.60, 0.30, 0.10], dtype=np.float64)
+    if progress < 2.0 / 3.0:
+        return np.array([0.25, 0.45, 0.30], dtype=np.float64)
+    return np.array([0.10, 0.30, 0.60], dtype=np.float64)
+
+
+def support_loss(pts: np.ndarray, support_target: SupportTarget) -> float:
+    scale = support_target.scale
+    px = np.clip(pts[:, 0].astype(np.int32), 0, scale - 1)
+    py = np.clip(pts[:, 1].astype(np.int32), 0, scale - 1)
+    forward = float(np.mean(support_target.dt_to_support[py, px]))
+
+    gen_mask = np.zeros((scale, scale), dtype=bool)
+    gen_mask[py, px] = True
+    gen_mask = dilate_mask(gen_mask, radius=1)
+    gen_dt = distance_transform(gen_mask)
+    target_py = support_target.support_points[:, 0]
+    target_px = support_target.support_points[:, 1]
+    reverse = float(np.mean(gen_dt[target_py, target_px]))
+    return forward + 0.75 * reverse
+
+
+def score_points_against_targets(
+    pts: np.ndarray,
+    target_levels: list[TargetLevel],
+    support_target: SupportTarget | None,
+    cfg: Config,
+    rng,
+    progress: float,
+) -> float:
     loss = 0.0
-    for level in target_levels:
+    weights = multiscale_weights(len(target_levels), progress)
+    for weight, level in zip(weights, target_levels, strict=True):
         if level.scale == cfg.img_size:
             scaled_pts = pts
         else:
             scaled_pts = pts * (level.scale / cfg.img_size)
-        loss += level.weight * sliced_wasserstein(scaled_pts, level.points, cfg.n_proj, rng)
+        loss += float(weight) * sliced_wasserstein(scaled_pts, level.points, cfg.n_proj, rng)
+    if support_target is not None:
+        support_pts = pts * (support_target.scale / cfg.img_size)
+        loss += 0.35 * support_loss(support_pts, support_target)
     return float(loss)
 
 
-def evaluate_population(model: AttractorModel, params, target_levels, cfg, rng):
+def evaluate_population(model: AttractorModel, params, target_levels, support_target, cfg, rng, progress: float):
     lam = params.shape[0]
     rejected, state, _ = transient_test(model, params, cfg)
     fitness = np.full(lam, cfg.max_penalty, dtype=np.float64)
@@ -450,7 +577,14 @@ def evaluate_population(model: AttractorModel, params, target_levels, cfg, rng):
         elif npts.shape[0] < cfg.n_sample:
             sel = rng.choice(npts.shape[0], size=cfg.n_sample, replace=True)
             npts = npts[sel]
-        fitness[i] = score_points_against_targets(npts, target_levels, cfg, rng)
+        fitness[i] = score_points_against_targets(
+            npts,
+            target_levels,
+            support_target,
+            cfg,
+            rng,
+            progress,
+        )
 
     return fitness, float(rejected.mean())
 
@@ -587,7 +721,7 @@ def render_attractor(model: AttractorModel, params: np.ndarray, cfg: Config, n_i
 def optimise(cfg: Config) -> tuple[np.ndarray, float, np.ndarray]:
     rng = np.random.default_rng(cfg.seed)
     model = get_model(cfg.model_name)
-    target_density, target_levels = build_target_levels(cfg, rng)
+    target_density, target_levels, support_target = build_target_levels(cfg, rng)
 
     es = CMAES(
         model.initial_mean(),
@@ -605,7 +739,15 @@ def optimise(cfg: Config) -> tuple[np.ndarray, float, np.ndarray]:
         inject = rng.random() < cfg.chaotic_injection_prob
         arx = es.ask(inject_chaos=inject)
         t0 = time.time()
-        fitness, rej_rate = evaluate_population(model, arx, target_levels, cfg, rng)
+        fitness, rej_rate = evaluate_population(
+            model,
+            arx,
+            target_levels,
+            support_target,
+            cfg,
+            rng,
+            progress=(gen - 1) / max(cfg.max_gens - 1, 1),
+        )
         dt = time.time() - t0
 
         if rej_rate > cfg.rejection_threshold:
