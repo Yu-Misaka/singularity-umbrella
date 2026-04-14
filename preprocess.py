@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -154,6 +155,18 @@ def _neighbors(mask: Array, row: int, col: int) -> list[tuple[int, int]]:
     return points
 
 
+def _weighted_neighbors(mask: Array, row: int, col: int) -> list[tuple[tuple[int, int], float]]:
+    points: list[tuple[tuple[int, int], float]] = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, nc = row + dr, col + dc
+            if 0 <= nr < mask.shape[0] and 0 <= nc < mask.shape[1] and mask[nr, nc]:
+                points.append(((nr, nc), float(np.hypot(dr, dc))))
+    return points
+
+
 def _zhang_suen_thinning(mask: Array) -> Array:
     skeleton = mask.copy()
     changed = True
@@ -218,45 +231,43 @@ def _find_endpoints(mask: Array) -> list[tuple[int, int]]:
     return endpoints
 
 
+def _farthest_pixel(mask: Array, start: tuple[int, int]) -> tuple[tuple[int, int], dict[tuple[int, int], float], dict[tuple[int, int], tuple[int, int] | None]]:
+    distances: dict[tuple[int, int], float] = {start: 0.0}
+    previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    queue: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
+
+    while queue:
+        distance, node = heapq.heappop(queue)
+        if distance > distances[node]:
+            continue
+        for neighbor, weight in _weighted_neighbors(mask, *node):
+            candidate = distance + weight
+            if candidate < distances.get(neighbor, float("inf")):
+                distances[neighbor] = candidate
+                previous[neighbor] = node
+                heapq.heappush(queue, (candidate, neighbor))
+
+    farthest = max(distances, key=distances.get)
+    return farthest, distances, previous
+
+
 def _trace_curve(mask: Array) -> Array:
-    endpoints = _find_endpoints(mask)
     rows, cols = np.nonzero(mask)
     if len(rows) == 0:
-        raise ValueError("skeleton is empty after preprocessing")
+        raise ValueError("mask is empty after preprocessing")
 
-    if endpoints:
-        start = min(endpoints, key=lambda rc: (rc[1], rc[0]))
-    else:
-        coords = np.column_stack([rows, cols])
-        start = tuple(map(int, coords[np.argmin(coords[:, 1])]))
+    start = (int(rows[0]), int(cols[0]))
+    end_a, _, _ = _farthest_pixel(mask, start)
+    end_b, _, previous = _farthest_pixel(mask, end_a)
 
-    visited: set[tuple[int, int]] = set()
-    order: list[tuple[int, int]] = [start]
-    current = start
-    previous: tuple[int, int] | None = None
+    path: list[tuple[int, int]] = []
+    cursor: tuple[int, int] | None = end_b
+    while cursor is not None:
+        path.append(cursor)
+        cursor = previous.get(cursor)
 
-    while True:
-        visited.add(current)
-        candidates = [point for point in _neighbors(mask, *current) if point != previous and point not in visited]
-        if not candidates:
-            remaining = [point for point in _neighbors(mask, *current) if point not in visited]
-            if not remaining:
-                break
-            candidates = remaining
-        if not candidates:
-            break
-        if previous is None:
-            next_point = min(candidates, key=lambda rc: (rc[1], rc[0]))
-        else:
-            prev_vec = np.array(current, dtype=float) - np.array(previous, dtype=float)
-            next_point = max(
-                candidates,
-                key=lambda rc: float(np.dot(np.array(rc, dtype=float) - np.array(current, dtype=float), prev_vec)),
-            )
-        order.append(next_point)
-        previous, current = current, next_point
-
-    ordered = np.array([(col, row) for row, col in order], dtype=float)
+    path.reverse()
+    ordered = np.array([(col, row) for row, col in path], dtype=float)
     return ordered
 
 
@@ -319,12 +330,9 @@ def fit_curve_from_image(
     mask = gray <= chosen_threshold
     mask = _binary_close(mask)
     mask = _largest_component(mask)
-    skeleton = _zhang_suen_thinning(mask)
-
-    if np.count_nonzero(skeleton) < 2:
-        raise ValueError("preprocessing removed too much of the curve; try a higher threshold")
-
-    traced_pixels = _trace_curve(skeleton)
+    traced_pixels = _trace_curve(mask)
+    if len(traced_pixels) < 2:
+        raise ValueError("failed to trace a usable curve from the image")
     resampled_pixels = _resample_polyline(traced_pixels, num_samples)
     normalized_samples = _normalize_points(resampled_pixels, image_size=(gray.shape[1], gray.shape[0]))
     scaled_samples = _scale_to_target_extent(normalized_samples, target_extent)
