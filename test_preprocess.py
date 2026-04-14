@@ -14,6 +14,12 @@ TEST_IMAGE = WORKDIR / "test.jpg"
 
 
 class PreprocessTests(unittest.TestCase):
+    """Regression tests for image preprocessing and the image-based pipeline."""
+
+    def setUp(self) -> None:
+        if not TEST_IMAGE.exists():
+            self.skipTest(f"missing fixture: {TEST_IMAGE}")
+
     def test_fit_curve_from_image_returns_normalized_samples(self) -> None:
         fit = fit_curve_from_image(TEST_IMAGE, num_samples=140)
         samples = fit.as_array()

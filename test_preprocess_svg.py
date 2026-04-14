@@ -15,6 +15,8 @@ TEST_SVG = WORKDIR / "experiment_outputs" / "test.svg"
 
 
 class PreprocessSvgTests(unittest.TestCase):
+    """Regression tests for SVG preprocessing and the SVG-based pipeline."""
+
     def test_fit_curve_from_svg_returns_scaled_samples(self) -> None:
         fit = fit_curve_from_svg(TEST_SVG, num_samples=140)
         samples = fit.as_array()

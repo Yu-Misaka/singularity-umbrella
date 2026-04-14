@@ -14,6 +14,8 @@ def sample_gamma(s: float) -> tuple[float, float]:
 
 
 class GuidedFieldTests(unittest.TestCase):
+    """Numerical sanity checks for the custom guided chaotic flow."""
+
     def test_guided_segment_tracks_target_curve(self) -> None:
         model = build_guided_chaotic_field(
             sample_gamma,

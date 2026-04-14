@@ -15,6 +15,8 @@ type Array = np.ndarray
 
 @dataclass(slots=True)
 class ComparisonImage:
+    """Summary of a rendered overlay image written to disk."""
+
     output_path: Path
     image_size: tuple[int, int]
     max_projection_error: float
@@ -38,6 +40,8 @@ def _fit_transform(
     height: int,
     margin: int,
 ) -> tuple[float, Array]:
+    """Build an affine map from model coordinates into image pixels."""
+
     xmin, ymin, xmax, ymax = bounds
     span_x = max(xmax - xmin, 1e-9)
     span_y = max(ymax - ymin, 1e-9)
@@ -81,6 +85,8 @@ def _draw_error_links(
     stride: int = 8,
     fill: tuple[int, int, int] = (215, 94, 77),
 ) -> None:
+    """Draw sparse connector lines between the guided orbit and target samples."""
+
     if len(guided_projection) == 0:
         return
     source = _map_points(guided_projection[::stride], affine)
@@ -90,6 +96,8 @@ def _draw_error_links(
 
 
 def _legend(draw: ImageDraw.ImageDraw, *, width: int, model: GuidedChaoticField) -> None:
+    """Render a compact legend and error summary in the top-left corner."""
+
     segment = model.guided_segment
     lines = [
         ("Orbit projection", (70, 78, 92)),
@@ -121,6 +129,12 @@ def render_comparison_image(
     image_size: tuple[int, int] = (1400, 1000),
     background: tuple[int, int, int] = (248, 249, 251),
 ) -> ComparisonImage:
+    """Render a single overlay image for visual comparison.
+
+    The image contains the full orbit projection, the target curve, the guided
+    orbit segment, and sparse pointwise error links.
+    """
+
     width, height = image_size
     if width < 200 or height < 200:
         raise ValueError("image_size is too small to render a useful comparison")
@@ -165,12 +179,16 @@ def build_and_render(
     image_size: tuple[int, int] = (1400, 1000),
     model_kwargs: dict | None = None,
 ) -> ComparisonImage:
+    """Convenience wrapper that builds a model and immediately renders it."""
+
     kwargs = {} if model_kwargs is None else dict(model_kwargs)
     model = build_guided_chaotic_field(gamma, **kwargs)
     return render_comparison_image(model, output_path=output_path, image_size=image_size)
 
 
 def demo_curve(s: float) -> tuple[float, float]:
+    """Small demo curve used by the standalone script entry point."""
+
     angle = 2.0 * np.pi * s
     radius = 4.0 + 0.6 * np.cos(3.0 * angle)
     return (

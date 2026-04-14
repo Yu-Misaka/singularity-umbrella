@@ -31,6 +31,8 @@ def _parse_length(text: str | None, fallback: float) -> float:
 
 
 def _resolve_viewbox(root: ET.Element) -> tuple[float, float, float, float]:
+    """Resolve the SVG coordinate box used for normalization."""
+
     viewbox = root.get("viewBox")
     if viewbox:
         numbers = [float(part) for part in re.split(r"[,\s]+", viewbox.strip()) if part]
@@ -42,6 +44,8 @@ def _resolve_viewbox(root: ET.Element) -> tuple[float, float, float, float]:
 
 
 def _sample_cubic(p0: Array, p1: Array, p2: Array, p3: Array, segments: int = 32) -> Array:
+    """Sample a cubic Bezier segment as a polyline."""
+
     t = np.linspace(0.0, 1.0, segments + 1, dtype=float)
     omt = 1.0 - t
     curve = (
@@ -54,6 +58,8 @@ def _sample_cubic(p0: Array, p1: Array, p2: Array, p3: Array, segments: int = 32
 
 
 def _sample_quadratic(p0: Array, p1: Array, p2: Array, segments: int = 24) -> Array:
+    """Sample a quadratic Bezier segment as a polyline."""
+
     t = np.linspace(0.0, 1.0, segments + 1, dtype=float)
     omt = 1.0 - t
     curve = (omt * omt)[:, None] * p0 + (2.0 * omt * t)[:, None] * p1 + (t * t)[:, None] * p2
@@ -72,6 +78,12 @@ def _is_command(token: str) -> bool:
 
 
 def _flatten_path(path_data: str) -> list[Array]:
+    """Convert SVG path data into one or more sampled polylines.
+
+    Supported commands are `M/L/H/V/C/S/Q/T/Z` in both absolute and relative
+    forms. Elliptic arc commands are intentionally left unsupported for now.
+    """
+
     tokens = _tokenize_path_data(path_data)
     index = 0
     command = ""
@@ -232,6 +244,8 @@ def _polyline_length(points: Array) -> float:
 
 
 def _normalize_svg_points(points: Array, *, viewbox: tuple[float, float, float, float]) -> Array:
+    """Normalize SVG coordinates by viewBox and flip y to Cartesian orientation."""
+
     min_x, min_y, width, height = viewbox
     if width <= 0 or height <= 0:
         raise ValueError("SVG viewBox must have positive width and height")
@@ -247,6 +261,8 @@ def fit_curve_from_svg(
     num_samples: int = 140,
     target_extent: float = 6.0,
 ) -> CurveFit:
+    """Extract the longest SVG path as a centered, scaled `CurveFit`."""
+
     tree = ET.parse(svg_path)
     root = tree.getroot()
     viewbox = _resolve_viewbox(root)
@@ -302,6 +318,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI entry point for SVG-to-curve preprocessing."""
+
     args = _build_parser().parse_args()
     fit = fit_curve_from_svg(args.svg, num_samples=args.samples, target_extent=args.target_extent)
     output_path = fit.save(args.output)

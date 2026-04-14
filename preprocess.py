@@ -16,6 +16,8 @@ type Array = np.ndarray
 
 @dataclass(slots=True)
 class CurveFit:
+    """Serializable sampled curve representation shared by the whole pipeline."""
+
     image_path: str
     image_size: tuple[int, int]
     threshold: int
@@ -44,16 +46,22 @@ class CurveFit:
 
 
 def load_curve_fit(path: str | Path) -> CurveFit:
+    """Load a previously saved `CurveFit` JSON file."""
+
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return CurveFit(**data)
 
 
 def _grayscale_array(image_path: str | Path) -> Array:
+    """Read an image as an 8-bit grayscale array."""
+
     image = Image.open(image_path).convert("L")
     return np.asarray(image, dtype=np.uint8)
 
 
 def _otsu_threshold(gray: Array) -> int:
+    """Choose a foreground/background split with Otsu's method."""
+
     histogram = np.bincount(gray.ravel(), minlength=256).astype(float)
     total = float(gray.size)
     sum_total = float(np.dot(np.arange(256), histogram))
@@ -105,6 +113,8 @@ def _binary_close(mask: Array) -> Array:
 
 
 def _largest_component(mask: Array) -> Array:
+    """Keep only the largest 8-connected foreground component."""
+
     height, width = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
     best_component: list[tuple[int, int]] = []
@@ -232,6 +242,8 @@ def _find_endpoints(mask: Array) -> list[tuple[int, int]]:
 
 
 def _farthest_pixel(mask: Array, start: tuple[int, int]) -> tuple[tuple[int, int], dict[tuple[int, int], float], dict[tuple[int, int], tuple[int, int] | None]]:
+    """Run Dijkstra on the foreground graph and return the farthest reachable pixel."""
+
     distances: dict[tuple[int, int], float] = {start: 0.0}
     previous: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     queue: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
@@ -252,6 +264,8 @@ def _farthest_pixel(mask: Array, start: tuple[int, int]) -> tuple[tuple[int, int
 
 
 def _trace_curve(mask: Array) -> Array:
+    """Extract the dominant stroke as the longest path in the foreground graph."""
+
     rows, cols = np.nonzero(mask)
     if len(rows) == 0:
         raise ValueError("mask is empty after preprocessing")
@@ -301,6 +315,8 @@ def _resample_polyline(points: Array, num_samples: int) -> Array:
 
 
 def _normalize_points(points: Array, image_size: Sequence[int]) -> Array:
+    """Normalize image coordinates by image size and flip y to Cartesian orientation."""
+
     width, height = image_size
     normalized = np.empty_like(points, dtype=float)
     normalized[:, 0] = points[:, 0] / max(width - 1, 1)
@@ -309,6 +325,8 @@ def _normalize_points(points: Array, image_size: Sequence[int]) -> Array:
 
 
 def _scale_to_target_extent(points: Array, target_extent: float) -> Array:
+    """Center the curve and scale its largest axis span to `target_extent`."""
+
     if target_extent <= 0:
         raise ValueError("target_extent must be positive")
     centered = np.asarray(points, dtype=float) - np.mean(points, axis=0, keepdims=True)
@@ -325,6 +343,12 @@ def fit_curve_from_image(
     target_extent: float = 6.0,
     threshold: int | None = None,
 ) -> CurveFit:
+    """Extract a sampled planar curve from a white-background black-line image.
+
+    The output samples are centered and rescaled to a fixed geometric extent so
+    they can be passed directly into `core.build_guided_chaotic_field`.
+    """
+
     gray = _grayscale_array(image_path)
     chosen_threshold = _otsu_threshold(gray) if threshold is None else int(threshold)
     mask = gray <= chosen_threshold
@@ -372,6 +396,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """CLI entry point for image-to-curve preprocessing."""
+
     args = _build_parser().parse_args()
     fit = fit_curve_from_image(
         args.image,

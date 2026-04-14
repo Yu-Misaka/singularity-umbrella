@@ -15,6 +15,8 @@ class CurveFn(Protocol):
 
 @dataclass(slots=True)
 class GuidedSegment:
+    """Metadata for the orbit interval whose 2D projection tracks the template curve."""
+
     start_index: int
     end_index: int
     start_time: float
@@ -25,6 +27,8 @@ class GuidedSegment:
 
 @dataclass(slots=True)
 class OrbitRecord:
+    """A sampled orbit in both abstract tube coordinates and embedded 3D space."""
+
     time: Array
     abstract: Array
     spatial: Array
@@ -32,6 +36,13 @@ class OrbitRecord:
 
 @dataclass(slots=True)
 class AbstractDynamics:
+    """Return-map-inspired dynamics in tube coordinates.
+
+    `theta` advances monotonically around the closed centerline. The transverse
+    coordinates `(u, v)` are strongly damped on the guided track interval and
+    excited on the return interval to produce bounded but irregular motion.
+    """
+
     omega: float = 1.0
     track_fraction: float = 0.6
     track_rate: float = 2.2980031125259206
@@ -83,6 +94,8 @@ class AbstractDynamics:
 
 @dataclass(slots=True)
 class TubeEmbedding:
+    """Embed abstract tube coordinates into a 3D neighborhood of the centerline."""
+
     centerline: Array
     normal1: Array
     normal2: Array
@@ -154,6 +167,8 @@ class TubeEmbedding:
 
 @dataclass(slots=True)
 class GuidedChaoticField:
+    """Bundle the custom vector field, sampled orbit, and template-matching metadata."""
+
     vector_field: Callable[[Array], Array]
     abstract_field: Callable[[Array], Array]
     embedding: TubeEmbedding
@@ -208,6 +223,8 @@ def rk4_integrate(
     dt: float,
     steps: int,
 ) -> tuple[Array, Array]:
+    """Integrate a 3D ODE with a fixed-step fourth-order Runge-Kutta scheme."""
+
     if dt <= 0:
         raise ValueError("dt must be positive")
     if steps < 1:
@@ -230,6 +247,8 @@ def rk4_integrate(
 
 
 def periodic_bump(theta: float, center: float, width: float) -> float:
+    """Smooth localized bump on the periodic interval `[0, 1)`."""
+
     if width <= 0:
         raise ValueError("width must be positive")
     distance = ((theta - center + 0.5) % 1.0) - 0.5
@@ -237,11 +256,15 @@ def periodic_bump(theta: float, center: float, width: float) -> float:
 
 
 def smoothstep(x: float) -> float:
+    """Cubic smoothstep used to soften interval transitions."""
+
     clipped = float(np.clip(x, 0.0, 1.0))
     return clipped * clipped * (3.0 - 2.0 * clipped)
 
 
 def periodic_interval_gate(theta: float, *, start: float, end: float, transition: float) -> float:
+    """Periodic indicator-like gate with smooth entrance/exit ramps."""
+
     if transition <= 0:
         raise ValueError("transition must be positive")
     x = theta % 1.0
@@ -314,6 +337,8 @@ def _normalize(vector: Array) -> Array:
 
 
 def _parallel_transport_frame(centerline: Array) -> tuple[Array, Array]:
+    """Construct a smooth orthonormal frame along the closed centerline."""
+
     tangent = np.roll(centerline, -1, axis=0) - np.roll(centerline, 1, axis=0)
     tangent = np.array([_normalize(vector) for vector in tangent], dtype=float)
 
@@ -359,6 +384,12 @@ def _build_closed_centerline(
     return_height: float,
     return_samples: int,
 ) -> tuple[Array, float]:
+    """Lift the target curve into 3D and close it with a smooth return arc.
+
+    The returned `track_fraction` is the fraction of one abstract revolution
+    that corresponds to the original guided curve segment.
+    """
+
     z_track = np.linspace(0.0, track_height, len(curve_samples), dtype=float)
     track = np.column_stack([curve_samples, z_track])
 
@@ -404,6 +435,8 @@ def _find_guided_segment(
     target_curve: Array,
     track_fraction: float,
 ) -> GuidedSegment:
+    """Locate the sampled orbit segment whose projection best matches the template."""
+
     theta = orbit.abstract[:, 0] % 1.0
     cycle = np.floor(orbit.abstract[:, 0]).astype(int)
     unique_cycles = np.unique(cycle)
@@ -445,6 +478,8 @@ def _estimate_separation_growth(
     dt: float,
     steps: int,
 ) -> tuple[float, float]:
+    """Compute a simple finite-time nearby-orbit separation diagnostic."""
+
     _, reference = rk4_integrate(field, initial_state, dt=dt, steps=steps)
     _, perturbed = rk4_integrate(
         field,
@@ -470,6 +505,25 @@ def build_guided_chaotic_field(
     initial_abstract_state: Sequence[float] = (0.0, 0.03, -0.02),
     dynamics: AbstractDynamics | None = None,
 ) -> GuidedChaoticField:
+    """Build the custom 3D dissipative flow guided by a target planar curve.
+
+    Parameters
+    ----------
+    gamma:
+        Target planar curve, either as a callable `gamma(s)` with `s in [0, 1]`
+        or as sampled `(x, y)` points.
+    num_curve_samples:
+        Number of samples used for the guided segment and closed centerline.
+    total_time / transient_time / dt:
+        Integration settings for the reference orbit stored on the returned model.
+
+    Returns
+    -------
+    GuidedChaoticField
+        The vector field itself plus one sampled orbit and metadata describing
+        which orbit interval follows the template.
+    """
+
     if num_curve_samples < 48:
         raise ValueError("num_curve_samples must be at least 48")
     if total_time <= transient_time:
@@ -559,6 +613,8 @@ def build_guided_chaotic_field(
 
 
 def run_self_checks() -> dict[str, float]:
+    """Run lightweight diagnostics used during development and smoke tests."""
+
     def gamma(s: float) -> tuple[float, float]:
         angle = 2.0 * np.pi * s
         return (
@@ -582,6 +638,8 @@ def run_self_checks() -> dict[str, float]:
 
 
 def build_demo_model() -> GuidedChaoticField:
+    """Construct a ready-to-render demo instance with a smooth closed template."""
+
     def gamma(s: float) -> tuple[float, float]:
         angle = 2.0 * np.pi * s
         radius = 4.0 + 0.6 * np.cos(3.0 * angle)
