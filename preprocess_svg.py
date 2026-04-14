@@ -255,13 +255,8 @@ def _normalize_svg_points(points: Array, *, viewbox: tuple[float, float, float, 
     return normalized
 
 
-def fit_curve_from_svg(
-    svg_path: str | Path,
-    *,
-    num_samples: int = 140,
-    target_extent: float = 6.0,
-) -> CurveFit:
-    """Extract the longest SVG path as a centered, scaled `CurveFit`."""
+def extract_svg_polylines(svg_path: str | Path) -> tuple[tuple[float, float, float, float], list[Array]]:
+    """Load an SVG and flatten all `<path>` geometry into sampled polylines."""
 
     tree = ET.parse(svg_path)
     root = tree.getroot()
@@ -278,20 +273,33 @@ def fit_curve_from_svg(
 
     if not path_polylines:
         raise ValueError("no <path> elements with geometry were found in the SVG")
+    return viewbox, path_polylines
 
-    selected = max(path_polylines, key=_polyline_length)
-    resampled = _resample_polyline(selected, num_samples)
+
+def curve_fit_from_polyline(
+    points: Array,
+    *,
+    svg_path: str | Path,
+    viewbox: tuple[float, float, float, float],
+    num_samples: int = 140,
+    target_extent: float = 6.0,
+) -> CurveFit:
+    """Convert one SVG polyline into the shared centered/scaled `CurveFit` format."""
+
+    if len(points) < 2:
+        raise ValueError("need at least two SVG points to build a curve fit")
+
+    resampled = _resample_polyline(np.asarray(points, dtype=float), num_samples)
     normalized = _normalize_svg_points(resampled, viewbox=viewbox)
     scaled = _scale_to_target_extent(normalized, target_extent)
 
     bounds = (
-        int(np.floor(np.min(selected[:, 0]))),
-        int(np.floor(np.min(selected[:, 1]))),
-        int(np.ceil(np.max(selected[:, 0]))),
-        int(np.ceil(np.max(selected[:, 1]))),
+        int(np.floor(np.min(points[:, 0]))),
+        int(np.floor(np.min(points[:, 1]))),
+        int(np.ceil(np.max(points[:, 0]))),
+        int(np.ceil(np.max(points[:, 1]))),
     )
     image_size = (int(round(viewbox[2])), int(round(viewbox[3])))
-
     return CurveFit(
         image_path=str(svg_path),
         image_size=image_size,
@@ -300,6 +308,25 @@ def fit_curve_from_svg(
         num_samples=num_samples,
         target_extent=float(target_extent),
         samples=scaled.tolist(),
+    )
+
+
+def fit_curve_from_svg(
+    svg_path: str | Path,
+    *,
+    num_samples: int = 140,
+    target_extent: float = 6.0,
+) -> CurveFit:
+    """Extract the longest SVG path as a centered, scaled `CurveFit`."""
+
+    viewbox, path_polylines = extract_svg_polylines(svg_path)
+    selected = max(path_polylines, key=_polyline_length)
+    return curve_fit_from_polyline(
+        selected,
+        svg_path=svg_path,
+        viewbox=viewbox,
+        num_samples=num_samples,
+        target_extent=target_extent,
     )
 
 
