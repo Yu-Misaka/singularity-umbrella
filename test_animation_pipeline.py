@@ -4,9 +4,28 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from dissect_svg import dissect_svg_to_directory
 from export_blender_paths import export_blender_paths
 from schedule_parts import build_schedule
+
+
+def _distance_to_polyline(point: np.ndarray, polyline: np.ndarray) -> float:
+    if len(polyline) < 2:
+        return float(np.linalg.norm(point - polyline[0]))
+    best = float("inf")
+    for start, end in zip(polyline[:-1], polyline[1:], strict=False):
+        segment = end - start
+        length_sq = float(np.dot(segment, segment))
+        if length_sq <= 1e-12:
+            candidate = float(np.linalg.norm(point - start))
+        else:
+            weight = float(np.clip(np.dot(point - start, segment) / length_sq, 0.0, 1.0))
+            projection = start + weight * segment
+            candidate = float(np.linalg.norm(point - projection))
+        best = min(best, candidate)
+    return best
 
 
 class AnimationPipelineTests(unittest.TestCase):
@@ -45,7 +64,7 @@ class AnimationPipelineTests(unittest.TestCase):
                 output_path=root / "schedule.json",
                 fps=24,
                 align_frame=120,
-                travel_frames=180,
+                frames_per_unit=12.0,
             )
 
             paths_payload = json.loads(paths_path.read_text(encoding="utf-8"))
@@ -56,10 +75,33 @@ class AnimationPipelineTests(unittest.TestCase):
             first_part = paths_payload["parts"][0]
             self.assertGreater(len(first_part["orbit_points_world"]), 10)
             self.assertGreater(len(first_part["guided_points_world"]), 10)
-            self.assertAlmostEqual(first_part["guided_segment"]["mid_factor"], schedule_payload["parts"][0]["guided_mid_factor"], places=6)
+            self.assertGreater(first_part["orbit_arc_length_total_world"], 0.0)
+            self.assertEqual(len(first_part["orbit_points_world"]), len(first_part["orbit_arc_length_samples_world"]))
+            self.assertLess(first_part["guided_segment"]["start_arc_length_world"], first_part["guided_segment"]["end_arc_length_world"])
+            orbit = np.asarray(first_part["orbit_points_world"], dtype=float)
+            entry = np.asarray(first_part["guided_entry_point_world"], dtype=float)
+            exit = np.asarray(first_part["guided_exit_point_world"], dtype=float)
+            self.assertLess(_distance_to_polyline(entry, orbit), 1e-6)
+            self.assertLess(_distance_to_polyline(exit, orbit), 1e-6)
+
+            enter_frames = {part["enter_target_frame"] for part in schedule_payload["parts"]}
+            self.assertEqual(len(enter_frames), 1)
+            self.assertEqual(next(iter(enter_frames)), schedule_payload["align_frame"])
+            self.assertEqual(schedule_payload["scene_frame_start"], 0)
+            travel_frames = {part["travel_frames"] for part in schedule_payload["parts"]}
+            self.assertGreater(len(travel_frames), 1)
+            self.assertEqual(min(part["start_frame"] for part in schedule_payload["parts"]), 0)
+            for part in schedule_payload["parts"]:
+                self.assertGreaterEqual(part["entry_progress"], 0.0)
+                self.assertLessEqual(part["exit_progress"], 1.0)
+                self.assertLess(part["entry_progress"], part["exit_progress"])
 
     def test_blender_import_script_compiles(self) -> None:
         py_compile.compile("blender_import.py", doraise=True)
+        source = Path("blender_import.py").read_text(encoding="utf-8")
+        self.assertIn("enter_target_event", source)
+        self.assertIn("inside_target_window", source)
+        self.assertIn("exit_target_event", source)
 
 
 if __name__ == "__main__":

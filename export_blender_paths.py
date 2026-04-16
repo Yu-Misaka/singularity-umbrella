@@ -107,6 +107,91 @@ def _slice_with_indices(points: Array, indices: Array) -> Array:
     return np.asarray(points, dtype=float)[indices]
 
 
+def _cumulative_arc_lengths(points: Array) -> Array:
+    """Return cumulative world-space arc length along a polyline."""
+
+    samples = np.asarray(points, dtype=float)
+    if len(samples) == 0:
+        raise ValueError("cannot measure arc length of an empty polyline")
+    if len(samples) == 1:
+        return np.array([0.0], dtype=float)
+    segment_lengths = np.linalg.norm(np.diff(samples, axis=0), axis=1)
+    return np.concatenate(([0.0], np.cumsum(segment_lengths)))
+
+
+def _sample_polyline_by_arc_length(points: Array, *, sample_count: int) -> tuple[Array, Array]:
+    """Resample a polyline uniformly by arc length."""
+
+    samples = np.asarray(points, dtype=float)
+    cumulative = _cumulative_arc_lengths(samples)
+    total = float(cumulative[-1])
+    if sample_count <= 0 or len(samples) <= sample_count or total <= 1e-12:
+        return samples.copy(), cumulative
+
+    targets = np.linspace(0.0, total, sample_count, dtype=float)
+    result = np.empty((sample_count, samples.shape[1]), dtype=float)
+    segment = 0
+    for index, target in enumerate(targets):
+        while segment + 1 < len(cumulative) and cumulative[segment + 1] < target:
+            segment += 1
+        if segment >= len(samples) - 1:
+            result[index] = samples[-1]
+            continue
+        local_start = cumulative[segment]
+        local_length = max(cumulative[segment + 1] - cumulative[segment], 1e-12)
+        weight = (target - local_start) / local_length
+        result[index] = (1.0 - weight) * samples[segment] + weight * samples[segment + 1]
+    return result, targets
+
+
+def _sample_polyline_at_arc_lengths(points: Array, cumulative: Array, targets: Array) -> Array:
+    """Sample a polyline at explicit cumulative arc-length positions."""
+
+    samples = np.asarray(points, dtype=float)
+    arc = np.asarray(cumulative, dtype=float)
+    query = np.asarray(targets, dtype=float)
+    if len(samples) != len(arc):
+        raise ValueError("points and cumulative arc lengths must have matching length")
+    if len(samples) == 0:
+        raise ValueError("cannot sample an empty polyline")
+    if len(samples) == 1:
+        return np.repeat(samples[:1], len(query), axis=0)
+
+    total = float(arc[-1])
+    clamped = np.clip(query, 0.0, total)
+    result = np.empty((len(clamped), samples.shape[1]), dtype=float)
+    segment = 0
+    for index, target in enumerate(clamped):
+        while segment + 1 < len(arc) and arc[segment + 1] < target:
+            segment += 1
+        if segment >= len(samples) - 1:
+            result[index] = samples[-1]
+            continue
+        local_start = arc[segment]
+        local_length = max(arc[segment + 1] - arc[segment], 1e-12)
+        weight = (target - local_start) / local_length
+        result[index] = (1.0 - weight) * samples[segment] + weight * samples[segment + 1]
+    return result
+
+
+def _extract_subpolyline_by_arc_length(
+    points: Array,
+    cumulative: Array,
+    *,
+    start_arc: float,
+    end_arc: float,
+    sample_count: int,
+) -> Array:
+    """Extract one arc-length window as a resampled sub-polyline."""
+
+    if end_arc < start_arc:
+        raise ValueError("end_arc must be greater than or equal to start_arc")
+    if sample_count < 2:
+        sample_count = 2
+    targets = np.linspace(start_arc, end_arc, sample_count, dtype=float)
+    return _sample_polyline_at_arc_lengths(points, cumulative, targets)
+
+
 def _part_report_lookup(batch_report_path: str | Path | None) -> dict[str, dict[str, Any]]:
     if batch_report_path is None:
         return {}
@@ -127,27 +212,22 @@ def _export_part_payload(
     batch_report_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     orbit = model.orbit
-    orbit_indices = _downsample_indices(len(orbit.spatial), orbit_sample_count)
-    guided_slice = slice(model.guided_segment.start_index, model.guided_segment.end_index + 1)
-    guided_local = orbit.spatial[guided_slice]
-    guided_indices = _downsample_indices(len(guided_local), guided_sample_count)
+    orbit_world_full = _local_to_world_points(
+        orbit.spatial,
+        normalized_center=tuple(part["normalized_center"]),
+        fit_scale=float(part["fit_scale"]),
+        viewbox=viewbox,
+        world=world,
+    )
+    orbit_cumulative_world = _cumulative_arc_lengths(orbit_world_full)
+    orbit_world, orbit_arc_samples_world = _sample_polyline_by_arc_length(
+        orbit_world_full,
+        sample_count=orbit_sample_count,
+    )
+    orbit_total_arc_world = float(orbit_cumulative_world[-1])
+    orbit_time_targets = orbit_arc_samples_world / max(orbit_total_arc_world, 1e-12) * float(orbit.time[-1])
     target_local = fit.as_array()
     target_indices = _downsample_indices(len(target_local), target_sample_count)
-
-    orbit_world = _local_to_world_points(
-        _slice_with_indices(orbit.spatial, orbit_indices),
-        normalized_center=tuple(part["normalized_center"]),
-        fit_scale=float(part["fit_scale"]),
-        viewbox=viewbox,
-        world=world,
-    )
-    guided_world = _local_to_world_points(
-        _slice_with_indices(guided_local, guided_indices),
-        normalized_center=tuple(part["normalized_center"]),
-        fit_scale=float(part["fit_scale"]),
-        viewbox=viewbox,
-        world=world,
-    )
 
     target_svg = _local_to_svg_xy(
         _slice_with_indices(target_local, target_indices),
@@ -160,6 +240,26 @@ def _export_part_payload(
 
     total_frames_factor = max(len(orbit.spatial) - 1, 1)
     guided_mid_index = 0.5 * (model.guided_segment.start_index + model.guided_segment.end_index)
+    guided_start_arc_world = float(orbit_cumulative_world[model.guided_segment.start_index])
+    guided_end_arc_world = float(orbit_cumulative_world[model.guided_segment.end_index])
+    guided_mid_arc_world = 0.5 * (guided_start_arc_world + guided_end_arc_world)
+    guided_world = _extract_subpolyline_by_arc_length(
+        orbit_world,
+        orbit_arc_samples_world,
+        start_arc=guided_start_arc_world,
+        end_arc=guided_end_arc_world,
+        sample_count=guided_sample_count,
+    )
+    guided_entry_point_world = _sample_polyline_at_arc_lengths(
+        orbit_world,
+        orbit_arc_samples_world,
+        np.array([guided_start_arc_world], dtype=float),
+    )[0]
+    guided_exit_point_world = _sample_polyline_at_arc_lengths(
+        orbit_world,
+        orbit_arc_samples_world,
+        np.array([guided_end_arc_world], dtype=float),
+    )[0]
     entry = {
         "part_id": part["part_id"],
         "curve_fit_path": part["curve_fit_path"],
@@ -169,9 +269,13 @@ def _export_part_payload(
             "fit_scale": float(part["fit_scale"]),
         },
         "orbit_duration": float(orbit.time[-1]),
-        "orbit_sample_times": orbit.time[orbit_indices].tolist(),
+        "orbit_sample_times": orbit_time_targets.tolist(),
         "orbit_points_world": orbit_world.tolist(),
+        "orbit_arc_length_samples_world": orbit_arc_samples_world.tolist(),
+        "orbit_arc_length_total_world": orbit_total_arc_world,
         "guided_points_world": guided_world.tolist(),
+        "guided_entry_point_world": guided_entry_point_world.tolist(),
+        "guided_exit_point_world": guided_exit_point_world.tolist(),
         "target_points_world": target_world.tolist(),
         "guided_segment": {
             "start_index": int(model.guided_segment.start_index),
@@ -182,6 +286,12 @@ def _export_part_payload(
             "start_factor": float(model.guided_segment.start_index / total_frames_factor),
             "end_factor": float(model.guided_segment.end_index / total_frames_factor),
             "mid_factor": float(guided_mid_index / total_frames_factor),
+            "start_progress": float(guided_start_arc_world / max(orbit_cumulative_world[-1], 1e-12)),
+            "end_progress": float(guided_end_arc_world / max(orbit_cumulative_world[-1], 1e-12)),
+            "mid_progress": float(guided_mid_arc_world / max(orbit_cumulative_world[-1], 1e-12)),
+            "start_arc_length_world": guided_start_arc_world,
+            "end_arc_length_world": guided_end_arc_world,
+            "mid_arc_length_world": guided_mid_arc_world,
             "max_projection_error": float(model.guided_segment.max_projection_error),
             "mean_projection_error": float(model.guided_segment.mean_projection_error),
         },
@@ -198,7 +308,7 @@ def export_blender_paths(
     *,
     output_path: str | Path | None = None,
     batch_report_path: str | Path | None = None,
-    orbit_sample_count: int = 900,
+    orbit_sample_count: int = 0,
     guided_sample_count: int = 180,
     target_sample_count: int = 180,
     world_config: WorldConfig | None = None,
@@ -266,7 +376,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("manifest", help="Path to dissect_svg manifest.json")
     parser.add_argument("--output", default=None, help="Output JSON path")
     parser.add_argument("--batch-report", default=None, help="Optional batch_report.json to merge per-part diagnostics")
-    parser.add_argument("--orbit-samples", type=int, default=900, help="Number of orbit samples exported per part")
+    parser.add_argument("--orbit-samples", type=int, default=0, help="Number of orbit samples exported per part; use 0 for full-resolution export")
     parser.add_argument("--guided-samples", type=int, default=180, help="Number of guided samples exported per part")
     parser.add_argument("--target-samples", type=int, default=180, help="Number of target samples exported per part")
     parser.add_argument("--canvas-extent", type=float, default=12.0, help="World-space width/height of the square canvas")

@@ -18,9 +18,9 @@ The code is organized around small, single-purpose scripts so that each stage st
 - [dissect_svg.py](./dissect_svg.py): split a complex SVG into filtered sub-curves and export per-part `CurveFit` files.
 - [batch_compose.py](./batch_compose.py): run the guided-field pipeline over all dissected parts and merge the results into one image.
 - [export_system.py](./export_system.py): export reconstructible system-definition JSON files for one part or a whole manifest.
-- [export_blender_paths.py](./export_blender_paths.py): export world-space 3D orbit, guided, and target paths for Blender.
-- [schedule_parts.py](./schedule_parts.py): generate a global animation schedule so all guided segments align on the same reveal frame.
-- [blender_import.py](./blender_import.py): Blender-side importer that creates curves, materials, and follower animation from exported JSON.
+- [export_blender_paths.py](./export_blender_paths.py): export world-space 3D orbit, guided, and target paths plus arc-length metadata for Blender.
+- [schedule_parts.py](./schedule_parts.py): generate an arc-length-synchronized global animation schedule for all parts.
+- [blender_import.py](./blender_import.py): Blender-side importer that creates viewport helper curves and follower animation from exported JSON.
 
 ## Environment
 
@@ -172,21 +172,29 @@ This converts each fitted part into Blender-friendly world-space paths:
 - guided segment path,
 - target curve path on the canvas plane,
 - object names and world transforms,
-- guided segment timing factors for synchronization.
+- cumulative world-space arc-length samples,
+- guided segment entry/exit arc-length metadata.
 
 ### 5. Build a synchronized animation schedule
 
 ```bash
 .venv/bin/python schedule_parts.py experiment_outputs/canary_1/blender_paths.json \
-  --output experiment_outputs/canary_1/animation_schedule.json
+  --output experiment_outputs/canary_1/animation_schedule.json \
+  --frames-per-unit 12
 ```
 
 This assigns:
 
-- a global reveal frame,
-- one start and end frame per part,
-- visibility windows,
-- a traversal window for each follower moving along its attractor.
+- one shared arc-length speed in frames per world unit,
+- one start and end frame per part derived from that speed,
+- one shared target-entry frame for all parts,
+- one target-exit frame per part,
+- visibility windows for helper curves and followers.
+
+Important detail:
+
+- `align_frame` means "all followers enter their guided segment here".
+- because the whole timeline is shifted so the earliest follower starts at frame `0`, the final `align_frame` written into `animation_schedule.json` can be larger than the requested raw value.
 
 ### 6. Import the result into Blender
 
@@ -216,9 +224,9 @@ blender_import.build_scene(
 The script will create:
 
 - one collection named `GuidedChaoticPortrait`,
-- faint full-attractor curves,
-- highlighted guided curves,
-- target curves on the projection plane,
+- viewport-only full-attractor helper curves,
+- viewport-only guided helper curves,
+- viewport-only target helper curves on the projection plane,
 - one follower object per part moving along the orbit.
 
 ## Reading the Output Files
@@ -380,7 +388,11 @@ Each item in `parts` contains:
 - `orbit_duration`
 - `orbit_sample_times`
 - `orbit_points_world`
+- `orbit_arc_length_samples_world`
+- `orbit_arc_length_total_world`
 - `guided_points_world`
+- `guided_entry_point_world`
+- `guided_exit_point_world`
 - `target_points_world`
 - `guided_segment`
 - `orbit_object_name`
@@ -388,13 +400,19 @@ Each item in `parts` contains:
 - `follower_object_name`
 - `batch_report`
 
-The `guided_segment` block includes both local simulation times and normalized orbit factors such as:
+The `guided_segment` block includes both local simulation times and arc-length/progress metadata such as:
 
 - `start_factor`
 - `end_factor`
 - `mid_factor`
+- `start_progress`
+- `end_progress`
+- `mid_progress`
+- `start_arc_length_world`
+- `end_arc_length_world`
+- `mid_arc_length_world`
 
-These are what the scheduler uses to align all parts on one reveal frame.
+The scheduler now primarily uses the world-space arc-length fields, not the factor fields. The factor fields are kept for debugging and cross-checking.
 
 ### `animation_schedule.json`
 
@@ -404,10 +422,10 @@ Top-level fields:
 
 - `paths_path`
 - `fps`
+- `align_frame_requested`
 - `align_frame`
-- `travel_frames`
+- `frames_per_unit`
 - `hold_frames`
-- `sync_mode`
 - `scene_frame_start`
 - `scene_frame_end`
 - `parts`
@@ -418,26 +436,61 @@ Each item in `parts` contains:
 - `orbit_object_name`
 - `guided_object_name`
 - `follower_object_name`
+- `frames_per_unit`
+- `raw_start_frame`
+- `raw_end_frame`
+- `raw_enter_target_frame`
+- `raw_exit_target_frame`
 - `start_frame`
 - `end_frame`
+- `enter_target_frame`
+- `exit_target_frame`
 - `align_frame`
+- `travel_frames`
+- `orbit_arc_length_total_world`
+- `guided_start_arc_length_world`
+- `guided_end_arc_length_world`
+- `guided_mid_arc_length_world`
 - `guided_reveal_start_frame`
 - `guided_reveal_end_frame`
 - `guided_start_factor`
 - `guided_end_factor`
 - `guided_mid_factor`
+- `guided_start_progress`
+- `guided_end_progress`
+- `guided_mid_progress`
 - `guided_start_time`
 - `guided_end_time`
 - `guided_mid_time`
 - `orbit_duration`
+- `entry_progress`
+- `exit_progress`
 - `hide_before_frame`
 - `hide_after_frame`
 
 In practical terms:
 
-- all parts are scheduled so their guided midpoints line up at `align_frame`,
-- each follower travels from factor `0` to `1` over `travel_frames`,
-- the highlighted guided stroke is visible only around the reveal window.
+- all parts are scheduled so their guided-segment entry happens at the same final `align_frame`,
+- each follower moves at the same world-space speed measured by `frames_per_unit`,
+- longer attractors therefore get larger `travel_frames`,
+- the whole schedule is shifted so the earliest part starts at frame `0`,
+- followers receive explicit entry and exit keyframes for downstream VFX work.
+
+## Blender Behavior
+
+The current Blender importer treats the exported curves as helper objects, not final rendered geometry.
+
+- orbit / guided / target curves are imported as `CURVE` objects with no bevel
+- they are visible in the viewport and hidden from final render
+- the follower is the main animated object
+- the follower gets custom keyed properties:
+  - `enter_target_event`
+  - `inside_target_window`
+  - `exit_target_event`
+  - `enter_target_frame`
+  - `exit_target_frame`
+
+These properties are intended to make later glow, shader, particle, or compositing effects easier to trigger.
 
 ## Recommended Workflow for Complex SVGs
 
@@ -459,6 +512,7 @@ In practical terms:
 - the guided-field model is intended for finite-time guided matching, not for making the entire attractor equal to the target drawing.
 - simple toy line segments may fit worse than the smoother medium-length curves this pipeline was tuned for.
 - the Blender importer was data-tested and syntax-tested, but visual tuning still depends on your local Blender version and scene setup.
+- under the current arc-length schedule, the final written `align_frame` can be much larger than the requested raw alignment frame if some attractors are long and you choose a slow `frames_per_unit`.
 
 ## Tests
 

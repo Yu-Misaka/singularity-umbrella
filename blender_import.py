@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - Blender-only runtime
 DEFAULT_PATHS = "experiment_outputs/canary_1/blender_paths.json"
 DEFAULT_SCHEDULE = "experiment_outputs/canary_1/animation_schedule.json"
 COLLECTION_NAME = "GuidedChaoticPortrait"
+CAMERA_NAME = "GuidedChaoticCamera"
 
 
 def _ensure_blender() -> None:
@@ -67,19 +68,50 @@ def _make_material(name: str, *, rgba: tuple[float, float, float, float]):
     return material
 
 
-def _make_poly_curve(name: str, points: list[list[float]], *, bevel_depth: float, collection, material):
+def _set_helper_curve_display(obj, *, rgba: tuple[float, float, float, float]) -> None:
+    obj.hide_render = True
+    obj.display_type = "WIRE"
+    obj.color = rgba
+    if hasattr(obj.data, "bevel_depth"):
+        obj.data.bevel_depth = 0.0
+    if hasattr(obj.data, "bevel_resolution"):
+        obj.data.bevel_resolution = 0
+
+
+def _ensure_projection_camera(paths_payload: dict):
+    """Create or update a top-down orthographic camera matching the projection model."""
+
+    world = paths_payload["world"]
+    canvas_extent = float(world["canvas_extent"])
+    canvas_z = float(world["canvas_z"])
+    local_depth_scale = float(world["local_to_world_depth_scale"])
+
+    camera_object = bpy.data.objects.get(CAMERA_NAME)
+    if camera_object is None or camera_object.type != "CAMERA":
+        camera_data = bpy.data.cameras.new(CAMERA_NAME)
+        camera_object = bpy.data.objects.new(CAMERA_NAME, camera_data)
+        bpy.context.scene.collection.objects.link(camera_object)
+
+    camera_object.data.type = "ORTHO"
+    camera_object.data.ortho_scale = canvas_extent * 1.05
+    camera_object.location = (0.0, 0.0, canvas_z + max(canvas_extent, local_depth_scale * 8.0, 8.0))
+    camera_object.rotation_euler = (0.0, 0.0, 0.0)
+    bpy.context.scene.camera = camera_object
+    return camera_object
+
+
+def _make_poly_curve(name: str, points: list[list[float]], *, collection):
     curve = bpy.data.curves.new(name=name, type="CURVE")
     curve.dimensions = "3D"
     curve.resolution_u = 2
-    curve.bevel_depth = bevel_depth
-    curve.bevel_resolution = 3
+    curve.bevel_depth = 0.0
+    curve.bevel_resolution = 0
     curve.use_path = True
     spline = curve.splines.new("POLY")
     spline.points.add(len(points) - 1)
     for spline_point, point in zip(spline.points, points, strict=False):
         spline_point.co = (point[0], point[1], point[2], 1.0)
     obj = bpy.data.objects.new(name, curve)
-    obj.data.materials.append(material)
     collection.objects.link(obj)
     return obj
 
@@ -113,6 +145,24 @@ def _set_visibility(obj, *, hide_before: int, hide_after: int) -> None:
         obj.keyframe_insert(data_path="hide_render", frame=frame)
 
 
+def _set_viewport_only_visibility(obj, *, hide_before: int, hide_after: int) -> None:
+    obj.hide_render = True
+    for frame, hidden in [
+        (hide_before, True),
+        (hide_before + 1, False),
+        (hide_after, False),
+        (hide_after + 1, True),
+    ]:
+        obj.hide_viewport = hidden
+        obj.keyframe_insert(data_path="hide_viewport", frame=frame)
+
+
+def _key_custom_property(obj, key: str, frame_values: list[tuple[int, float]]) -> None:
+    for frame, value in frame_values:
+        obj[key] = float(value)
+        obj.keyframe_insert(data_path=f'["{key}"]', frame=int(frame))
+
+
 def _animate_follower(follower, curve_obj, part_schedule: dict) -> None:
     constraint = follower.constraints.new(type="FOLLOW_PATH")
     constraint.target = curve_obj
@@ -121,10 +171,49 @@ def _animate_follower(follower, curve_obj, part_schedule: dict) -> None:
     constraint.forward_axis = "FORWARD_Y"
     constraint.up_axis = "UP_Z"
     curve_obj.data.path_duration = max(1, int(part_schedule["travel_frames"]))
+
+    follower["enter_target_frame"] = int(part_schedule["enter_target_frame"])
+    follower["exit_target_frame"] = int(part_schedule["exit_target_frame"])
+    follower["entry_progress"] = float(part_schedule["entry_progress"])
+    follower["exit_progress"] = float(part_schedule["exit_progress"])
+
     constraint.offset_factor = 0.0
     constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["start_frame"])
+    constraint.offset_factor = float(part_schedule["entry_progress"])
+    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["enter_target_frame"])
+    constraint.offset_factor = float(part_schedule["exit_progress"])
+    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["exit_target_frame"])
     constraint.offset_factor = 1.0
     constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["end_frame"])
+
+    _key_custom_property(
+        follower,
+        "enter_target_event",
+        [
+            (max(0, part_schedule["enter_target_frame"] - 1), 0.0),
+            (part_schedule["enter_target_frame"], 1.0),
+            (part_schedule["enter_target_frame"] + 1, 0.0),
+        ],
+    )
+    _key_custom_property(
+        follower,
+        "inside_target_window",
+        [
+            (max(0, part_schedule["enter_target_frame"] - 1), 0.0),
+            (part_schedule["enter_target_frame"], 1.0),
+            (part_schedule["exit_target_frame"], 1.0),
+            (part_schedule["exit_target_frame"] + 1, 0.0),
+        ],
+    )
+    _key_custom_property(
+        follower,
+        "exit_target_event",
+        [
+            (max(0, part_schedule["exit_target_frame"] - 1), 0.0),
+            (part_schedule["exit_target_frame"], 1.0),
+            (part_schedule["exit_target_frame"] + 1, 0.0),
+        ],
+    )
 
 
 def _animate_guided_visibility(obj, part_schedule: dict) -> None:
@@ -137,9 +226,7 @@ def _animate_guided_visibility(obj, part_schedule: dict) -> None:
         (reveal_end + 1, True),
     ]:
         obj.hide_viewport = hidden
-        obj.hide_render = hidden
         obj.keyframe_insert(data_path="hide_viewport", frame=frame)
-        obj.keyframe_insert(data_path="hide_render", frame=frame)
 
 
 def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Path = DEFAULT_SCHEDULE) -> None:
@@ -153,15 +240,13 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
     collection = _ensure_collection(COLLECTION_NAME)
     _clear_collection(collection)
 
-    orbit_material = _make_material("OrbitMaterial", rgba=(0.40, 0.66, 0.88, 0.14))
-    guided_material = _make_material("GuidedMaterial", rgba=(0.12, 0.46, 0.86, 0.92))
-    target_material = _make_material("TargetMaterial", rgba=(0.15, 0.16, 0.18, 0.70))
     follower_material = _make_material("FollowerMaterial", rgba=(0.95, 0.96, 0.99, 1.0))
 
     scene = bpy.context.scene
     scene.render.fps = int(schedule_payload["fps"])
     scene.frame_start = int(schedule_payload["scene_frame_start"])
     scene.frame_end = int(schedule_payload["scene_frame_end"])
+    _ensure_projection_camera(paths_payload)
 
     for part in paths_payload["parts"]:
         schedule = schedule_lookup.get(part["part_id"])
@@ -171,23 +256,17 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
         orbit_obj = _make_poly_curve(
             part["orbit_object_name"],
             part["orbit_points_world"],
-            bevel_depth=0.010,
             collection=collection,
-            material=orbit_material,
         )
         guided_obj = _make_poly_curve(
             part["guided_object_name"],
             part["guided_points_world"],
-            bevel_depth=0.020,
             collection=collection,
-            material=guided_material,
         )
         target_obj = _make_poly_curve(
             f"{part['part_id']}_target",
             part["target_points_world"],
-            bevel_depth=0.006,
             collection=collection,
-            material=target_material,
         )
         follower_obj = _make_follower(
             part["follower_object_name"],
@@ -196,8 +275,12 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
             material=follower_material,
         )
 
-        _set_visibility(orbit_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
-        _set_visibility(target_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
+        _set_helper_curve_display(orbit_obj, rgba=(0.40, 0.66, 0.88, 0.35))
+        _set_helper_curve_display(guided_obj, rgba=(0.12, 0.46, 0.86, 1.0))
+        _set_helper_curve_display(target_obj, rgba=(0.15, 0.16, 0.18, 0.70))
+
+        _set_viewport_only_visibility(orbit_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
+        _set_viewport_only_visibility(target_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
         _set_visibility(follower_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
         _animate_guided_visibility(guided_obj, schedule)
         _animate_follower(follower_obj, orbit_obj, schedule)
