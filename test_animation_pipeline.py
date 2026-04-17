@@ -102,6 +102,9 @@ class AnimationPipelineTests(unittest.TestCase):
         self.assertIn("enter_target_event", source)
         self.assertIn("inside_target_window", source)
         self.assertIn("exit_target_event", source)
+        self.assertIn("GeometryNodeSampleCurve", source)
+        self.assertIn("GeometryNodeInstanceOnPoints", source)
+        self.assertNotIn("primitive_uv_sphere_add", source)
 
 
 if __name__ == "__main__":

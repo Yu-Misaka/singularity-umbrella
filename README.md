@@ -20,7 +20,7 @@ The code is organized around small, single-purpose scripts so that each stage st
 - [export_system.py](./export_system.py): export reconstructible system-definition JSON files for one part or a whole manifest.
 - [export_blender_paths.py](./export_blender_paths.py): export world-space 3D orbit, guided, and target paths plus arc-length metadata for Blender.
 - [schedule_parts.py](./schedule_parts.py): generate an arc-length-synchronized global animation schedule for all parts.
-- [blender_import.py](./blender_import.py): Blender-side importer that creates viewport helper curves and follower animation from exported JSON.
+- [blender_import.py](./blender_import.py): Blender-side importer that creates viewport helper curves and Geometry Nodes follower rigs from exported JSON.
 
 ## Environment
 
@@ -189,7 +189,7 @@ This assigns:
 - one start and end frame per part derived from that speed,
 - one shared target-entry frame for all parts,
 - one target-exit frame per part,
-- visibility windows for helper curves and followers.
+- visibility windows for helper curves and follower rigs.
 
 Important detail:
 
@@ -227,7 +227,7 @@ The script will create:
 - viewport-only full-attractor helper curves,
 - viewport-only guided helper curves,
 - viewport-only target helper curves on the projection plane,
-- one follower object per part moving along the orbit.
+- one Geometry Nodes follower object per part moving along the orbit.
 
 ## Reading the Output Files
 
@@ -478,10 +478,11 @@ In practical terms:
 
 ## Blender Behavior
 
-The current Blender importer treats the exported curves as helper objects, not final rendered geometry.
+The current Blender importer treats the exported curves as helper objects and builds the visible follower geometry procedurally with Geometry Nodes.
 
 - orbit / guided / target curves are imported as `CURVE` objects with no bevel
 - they are visible in the viewport and hidden from final render
+- each follower object is an empty host with a Geometry Nodes modifier, not a standalone sphere mesh
 - the follower is the main animated object
 - the follower gets custom keyed properties:
   - `enter_target_event`

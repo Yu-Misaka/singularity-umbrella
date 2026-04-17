@@ -14,6 +14,8 @@ DEFAULT_PATHS = "experiment_outputs/canary_1/blender_paths.json"
 DEFAULT_SCHEDULE = "experiment_outputs/canary_1/animation_schedule.json"
 COLLECTION_NAME = "GuidedChaoticPortrait"
 CAMERA_NAME = "GuidedChaoticCamera"
+FOLLOWER_RADIUS = 0.035
+FOLLOWER_GROUP_PREFIX = "GuidedChaoticFollowerGN"
 
 
 def _ensure_blender() -> None:
@@ -36,6 +38,12 @@ def _ensure_collection(name: str):
 def _clear_collection(collection) -> None:
     for obj in list(collection.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
+
+
+def _clear_generated_node_groups() -> None:
+    for node_group in list(bpy.data.node_groups):
+        if node_group.name.startswith(FOLLOWER_GROUP_PREFIX):
+            bpy.data.node_groups.remove(node_group, do_unlink=True)
 
 
 def _make_material(name: str, *, rgba: tuple[float, float, float, float]):
@@ -116,20 +124,11 @@ def _make_poly_curve(name: str, points: list[list[float]], *, collection):
     return obj
 
 
-def _make_follower(name: str, *, radius: float, collection, material):
-    bpy.ops.object.select_all(action="DESELECT")
-    bpy.ops.mesh.primitive_uv_sphere_add(radius=radius, location=(0.0, 0.0, 0.0))
-    sphere = bpy.context.active_object
-    sphere.name = name
-    if sphere.data.materials:
-        sphere.data.materials[0] = material
-    else:
-        sphere.data.materials.append(material)
-    collection.objects.link(sphere)
-    scene_collection = bpy.context.scene.collection
-    if sphere.name in scene_collection.objects:
-        scene_collection.objects.unlink(sphere)
-    return sphere
+def _make_follower_host(name: str, *, collection):
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+    return obj
 
 
 def _set_visibility(obj, *, hide_before: int, hide_after: int) -> None:
@@ -163,29 +162,132 @@ def _key_custom_property(obj, key: str, frame_values: list[tuple[int, float]]) -
         obj.keyframe_insert(data_path=f'["{key}"]', frame=int(frame))
 
 
-def _animate_follower(follower, curve_obj, part_schedule: dict) -> None:
-    constraint = follower.constraints.new(type="FOLLOW_PATH")
-    constraint.target = curve_obj
-    constraint.use_curve_follow = True
-    constraint.use_fixed_location = True
-    constraint.forward_axis = "FORWARD_Y"
-    constraint.up_axis = "UP_Z"
-    curve_obj.data.path_duration = max(1, int(part_schedule["travel_frames"]))
+def _ensure_group_socket(node_group, *, name: str, in_out: str, socket_type: str) -> None:
+    interface = getattr(node_group, "interface", None)
+    if interface is not None and hasattr(interface, "new_socket"):
+        interface.new_socket(name=name, in_out=in_out, socket_type=socket_type)
+        return
+    if in_out == "INPUT":
+        node_group.inputs.new(socket_type, name)
+    else:
+        node_group.outputs.new(socket_type, name)
+
+
+def _build_follower_geometry_nodes(
+    follower_obj,
+    *,
+    orbit_obj,
+    part_schedule: dict,
+    radius: float,
+    material,
+    orbit_sample_count: int,
+):
+    node_group = bpy.data.node_groups.new(
+        name=f"{FOLLOWER_GROUP_PREFIX}_{follower_obj.name}",
+        type="GeometryNodeTree",
+    )
+    _ensure_group_socket(node_group, name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    _ensure_group_socket(node_group, name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+
+    nodes = node_group.nodes
+    links = node_group.links
+    nodes.clear()
+
+    group_input = nodes.new(type="NodeGroupInput")
+    group_output = nodes.new(type="NodeGroupOutput")
+    object_info = nodes.new(type="GeometryNodeObjectInfo")
+    resample_curve = nodes.new(type="GeometryNodeResampleCurve")
+    scene_time = nodes.new(type="GeometryNodeInputSceneTime")
+    subtract = nodes.new(type="ShaderNodeMath")
+    divide = nodes.new(type="ShaderNodeMath")
+    sample_curve = nodes.new(type="GeometryNodeSampleCurve")
+    mesh_line = nodes.new(type="GeometryNodeMeshLine")
+    set_position = nodes.new(type="GeometryNodeSetPosition")
+    ico_sphere = nodes.new(type="GeometryNodeMeshIcoSphere")
+    instance_on_points = nodes.new(type="GeometryNodeInstanceOnPoints")
+    realize_instances = nodes.new(type="GeometryNodeRealizeInstances")
+    set_material = nodes.new(type="GeometryNodeSetMaterial")
+
+    group_input.location = (-1240.0, 0.0)
+    object_info.location = (-1040.0, 240.0)
+    resample_curve.location = (-820.0, 240.0)
+    scene_time.location = (-1040.0, -220.0)
+    subtract.location = (-820.0, -220.0)
+    divide.location = (-620.0, -220.0)
+    sample_curve.location = (-400.0, 180.0)
+    mesh_line.location = (-400.0, -80.0)
+    set_position.location = (-180.0, -80.0)
+    ico_sphere.location = (-180.0, -320.0)
+    instance_on_points.location = (40.0, -80.0)
+    realize_instances.location = (260.0, -80.0)
+    set_material.location = (480.0, -80.0)
+    group_output.location = (720.0, -80.0)
+
+    object_info.inputs["Object"].default_value = orbit_obj
+
+    if hasattr(resample_curve, "mode"):
+        resample_curve.mode = "COUNT"
+    resample_curve.inputs["Count"].default_value = int(max(2, orbit_sample_count))
+
+    subtract.operation = "SUBTRACT"
+    subtract.inputs[1].default_value = float(part_schedule["start_frame"])
+
+    divide.operation = "DIVIDE"
+    divide.use_clamp = True
+    divide.inputs[1].default_value = float(max(1, part_schedule["travel_frames"]))
+
+    if hasattr(sample_curve, "mode"):
+        sample_curve.mode = "FACTOR"
+
+    mesh_line.inputs["Count"].default_value = 1
+    ico_sphere.inputs["Radius"].default_value = float(radius)
+    if "Subdivisions" in ico_sphere.inputs:
+        ico_sphere.inputs["Subdivisions"].default_value = 2
+    set_material.inputs["Material"].default_value = material
+
+    links.new(object_info.outputs["Geometry"], resample_curve.inputs["Curve"])
+    links.new(resample_curve.outputs["Curve"], sample_curve.inputs["Curves"])
+    links.new(scene_time.outputs["Frame"], subtract.inputs[0])
+    links.new(subtract.outputs["Value"], divide.inputs[0])
+    links.new(divide.outputs["Value"], sample_curve.inputs["Factor"])
+    links.new(mesh_line.outputs["Mesh"], set_position.inputs["Geometry"])
+    links.new(sample_curve.outputs["Position"], set_position.inputs["Position"])
+    links.new(set_position.outputs["Geometry"], instance_on_points.inputs["Points"])
+    links.new(ico_sphere.outputs["Mesh"], instance_on_points.inputs["Instance"])
+    links.new(instance_on_points.outputs["Instances"], realize_instances.inputs["Geometry"])
+    links.new(realize_instances.outputs["Geometry"], set_material.inputs["Geometry"])
+    links.new(set_material.outputs["Geometry"], group_output.inputs["Geometry"])
+
+    modifier = follower_obj.modifiers.new(name="FollowerGeometry", type="NODES")
+    modifier.node_group = node_group
+    return modifier
+
+
+def _animate_follower(follower, orbit_obj, part_schedule: dict, *, material, orbit_sample_count: int) -> None:
+    _build_follower_geometry_nodes(
+        follower,
+        orbit_obj=orbit_obj,
+        part_schedule=part_schedule,
+        radius=FOLLOWER_RADIUS,
+        material=material,
+        orbit_sample_count=orbit_sample_count,
+    )
 
     follower["enter_target_frame"] = int(part_schedule["enter_target_frame"])
     follower["exit_target_frame"] = int(part_schedule["exit_target_frame"])
     follower["entry_progress"] = float(part_schedule["entry_progress"])
     follower["exit_progress"] = float(part_schedule["exit_progress"])
 
-    constraint.offset_factor = 0.0
-    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["start_frame"])
-    constraint.offset_factor = float(part_schedule["entry_progress"])
-    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["enter_target_frame"])
-    constraint.offset_factor = float(part_schedule["exit_progress"])
-    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["exit_target_frame"])
-    constraint.offset_factor = 1.0
-    constraint.keyframe_insert(data_path="offset_factor", frame=part_schedule["end_frame"])
-
+    _key_custom_property(
+        follower,
+        "path_progress",
+        [
+            (part_schedule["start_frame"], 0.0),
+            (part_schedule["enter_target_frame"], float(part_schedule["entry_progress"])),
+            (part_schedule["exit_target_frame"], float(part_schedule["exit_progress"])),
+            (part_schedule["end_frame"], 1.0),
+        ],
+    )
     _key_custom_property(
         follower,
         "enter_target_event",
@@ -239,6 +341,7 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
 
     collection = _ensure_collection(COLLECTION_NAME)
     _clear_collection(collection)
+    _clear_generated_node_groups()
 
     follower_material = _make_material("FollowerMaterial", rgba=(0.95, 0.96, 0.99, 1.0))
 
@@ -268,11 +371,9 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
             part["target_points_world"],
             collection=collection,
         )
-        follower_obj = _make_follower(
+        follower_obj = _make_follower_host(
             part["follower_object_name"],
-            radius=0.035,
             collection=collection,
-            material=follower_material,
         )
 
         _set_helper_curve_display(orbit_obj, rgba=(0.40, 0.66, 0.88, 0.35))
@@ -283,7 +384,13 @@ def build_scene(paths_path: str | Path = DEFAULT_PATHS, schedule_path: str | Pat
         _set_viewport_only_visibility(target_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
         _set_visibility(follower_obj, hide_before=schedule["hide_before_frame"], hide_after=schedule["hide_after_frame"])
         _animate_guided_visibility(guided_obj, schedule)
-        _animate_follower(follower_obj, orbit_obj, schedule)
+        _animate_follower(
+            follower_obj,
+            orbit_obj,
+            schedule,
+            material=follower_material,
+            orbit_sample_count=len(part["orbit_points_world"]),
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - Blender-only runtime
