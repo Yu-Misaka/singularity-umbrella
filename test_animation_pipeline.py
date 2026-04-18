@@ -63,8 +63,8 @@ class AnimationPipelineTests(unittest.TestCase):
                 paths_path,
                 output_path=root / "schedule.json",
                 fps=24,
-                align_frame=120,
-                frames_per_unit=12.0,
+                enter_frame=120,
+                exit_frame=168,
             )
 
             paths_payload = json.loads(paths_path.read_text(encoding="utf-8"))
@@ -84,17 +84,23 @@ class AnimationPipelineTests(unittest.TestCase):
             self.assertLess(_distance_to_polyline(entry, orbit), 1e-6)
             self.assertLess(_distance_to_polyline(exit, orbit), 1e-6)
 
+            self.assertEqual(schedule_payload["schedule_mode"], "adaptive_window")
             enter_frames = {part["enter_target_frame"] for part in schedule_payload["parts"]}
+            exit_frames = {part["exit_target_frame"] for part in schedule_payload["parts"]}
             self.assertEqual(len(enter_frames), 1)
-            self.assertEqual(next(iter(enter_frames)), schedule_payload["align_frame"])
-            self.assertEqual(schedule_payload["scene_frame_start"], 0)
-            travel_frames = {part["travel_frames"] for part in schedule_payload["parts"]}
-            self.assertGreater(len(travel_frames), 1)
-            self.assertEqual(min(part["start_frame"] for part in schedule_payload["parts"]), 0)
+            self.assertEqual(len(exit_frames), 1)
+            self.assertEqual(next(iter(enter_frames)), 120)
+            self.assertEqual(next(iter(exit_frames)), 168)
+            self.assertEqual(schedule_payload["align_frame"], 120)
+            self.assertLessEqual(schedule_payload["scene_frame_start"], min(part["start_frame"] for part in schedule_payload["parts"]))
+            frames_per_unit = {round(part["frames_per_unit"], 6) for part in schedule_payload["parts"]}
+            self.assertGreater(len(frames_per_unit), 1)
             for part in schedule_payload["parts"]:
+                self.assertEqual(part["schedule_mode"], "adaptive_window")
                 self.assertGreaterEqual(part["entry_progress"], 0.0)
                 self.assertLessEqual(part["exit_progress"], 1.0)
                 self.assertLess(part["entry_progress"], part["exit_progress"])
+                self.assertAlmostEqual(part["exit_target_frame"] - part["enter_target_frame"], 48)
 
     def test_blender_import_script_compiles(self) -> None:
         py_compile.compile("blender_import.py", doraise=True)

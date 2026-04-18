@@ -156,10 +156,10 @@ def _set_viewport_only_visibility(obj, *, hide_before: int, hide_after: int) -> 
         obj.keyframe_insert(data_path="hide_viewport", frame=frame)
 
 
-def _key_custom_property(obj, key: str, frame_values: list[tuple[int, float]]) -> None:
+def _key_custom_property(obj, key: str, frame_values: list[tuple[float, float]]) -> None:
     for frame, value in frame_values:
         obj[key] = float(value)
-        obj.keyframe_insert(data_path=f'["{key}"]', frame=int(frame))
+        obj.keyframe_insert(data_path=f'["{key}"]', frame=float(frame))
 
 
 def _ensure_group_socket(node_group, *, name: str, in_out: str, socket_type: str) -> None:

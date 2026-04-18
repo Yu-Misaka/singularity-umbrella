@@ -19,7 +19,7 @@ The code is organized around small, single-purpose scripts so that each stage st
 - [batch_compose.py](./batch_compose.py): run the guided-field pipeline over all dissected parts and merge the results into one image.
 - [export_system.py](./export_system.py): export reconstructible system-definition JSON files for one part or a whole manifest.
 - [export_blender_paths.py](./export_blender_paths.py): export world-space 3D orbit, guided, and target paths plus arc-length metadata for Blender.
-- [schedule_parts.py](./schedule_parts.py): generate an arc-length-synchronized global animation schedule for all parts.
+- [schedule_parts.py](./schedule_parts.py): generate a global animation schedule with shared guided entry/exit frames and per-part adaptive speed.
 - [blender_import.py](./blender_import.py): Blender-side importer that creates viewport helper curves and Geometry Nodes follower rigs from exported JSON.
 
 ## Environment
@@ -180,21 +180,23 @@ This converts each fitted part into Blender-friendly world-space paths:
 ```bash
 .venv/bin/python schedule_parts.py experiment_outputs/canary_1/blender_paths.json \
   --output experiment_outputs/canary_1/animation_schedule.json \
-  --frames-per-unit 12
+  --enter-frame 240 \
+  --exit-frame 312
 ```
 
 This assigns:
 
-- one shared arc-length speed in frames per world unit,
-- one start and end frame per part derived from that speed,
 - one shared target-entry frame for all parts,
-- one target-exit frame per part,
+- one shared target-exit frame for all parts,
+- one per-part adaptive speed so each guided segment spans that same frame window,
+- one start and end frame per part implied by that adaptive speed,
 - visibility windows for helper curves and follower rigs.
 
 Important detail:
 
-- `align_frame` means "all followers enter their guided segment here".
-- because the whole timeline is shifted so the earliest follower starts at frame `0`, the final `align_frame` written into `animation_schedule.json` can be larger than the requested raw value.
+- `enter_frame` means "all followers enter their guided segment here".
+- `exit_frame` means "all followers leave their guided segment here".
+- because entry and exit frames are now fixed directly, the schedule no longer shifts the whole timeline to force frame `0` at the earliest start.
 
 ### 6. Import the result into Blender
 
@@ -422,6 +424,9 @@ Top-level fields:
 
 - `paths_path`
 - `fps`
+- `schedule_mode`
+- `enter_frame_requested`
+- `exit_frame_requested`
 - `align_frame_requested`
 - `align_frame`
 - `frames_per_unit`
@@ -436,6 +441,7 @@ Each item in `parts` contains:
 - `orbit_object_name`
 - `guided_object_name`
 - `follower_object_name`
+- `schedule_mode`
 - `frames_per_unit`
 - `raw_start_frame`
 - `raw_end_frame`
@@ -447,6 +453,7 @@ Each item in `parts` contains:
 - `exit_target_frame`
 - `align_frame`
 - `travel_frames`
+- `target_window_frames`
 - `orbit_arc_length_total_world`
 - `guided_start_arc_length_world`
 - `guided_end_arc_length_world`
@@ -470,10 +477,10 @@ Each item in `parts` contains:
 
 In practical terms:
 
-- all parts are scheduled so their guided-segment entry happens at the same final `align_frame`,
-- each follower moves at the same world-space speed measured by `frames_per_unit`,
-- longer attractors therefore get larger `travel_frames`,
-- the whole schedule is shifted so the earliest part starts at frame `0`,
+- all parts are scheduled so their guided-segment entry happens at the same final `enter_target_frame`,
+- all parts are also scheduled so their guided-segment exit happens at the same final `exit_target_frame`,
+- each follower gets its own adaptive `frames_per_unit` so that fixed entry and exit frames still line up with that part's guided segment,
+- the earliest start frame can now be negative if a long attractor needs extra lead-in before the shared entry frame,
 - followers receive explicit entry and exit keyframes for downstream VFX work.
 
 ## Blender Behavior
@@ -513,7 +520,7 @@ These properties are intended to make later glow, shader, particle, or compositi
 - the guided-field model is intended for finite-time guided matching, not for making the entire attractor equal to the target drawing.
 - simple toy line segments may fit worse than the smoother medium-length curves this pipeline was tuned for.
 - the Blender importer was data-tested and syntax-tested, but visual tuning still depends on your local Blender version and scene setup.
-- under the current arc-length schedule, the final written `align_frame` can be much larger than the requested raw alignment frame if some attractors are long and you choose a slow `frames_per_unit`.
+- under the adaptive-window schedule, the earliest start frame can be negative if some attractors need a long lead-in before the shared entry frame.
 
 ## Tests
 
